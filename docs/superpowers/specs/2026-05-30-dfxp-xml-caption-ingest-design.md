@@ -2,7 +2,9 @@
 
 **Date:** 2026-05-30
 **Status:** Design — awaiting user review
-**Scope:** This phase = **ingestion parity only**. Make the MCP place a `.dfxp`/`.xml` (TTML-family) caption file onto a caption track, the same way it already does for `.srt`. **Positioning (FN-top / DX-bottom) is explicitly OUT OF SCOPE** for this phase and will be tackled separately.
+**Scope:** This phase = **native DFXP/XML ingestion**. Make the MCP place a `.dfxp`/`.xml` (TTML-family) caption file onto a caption track, the same way it already does for `.srt`, **preserving whatever positioning Premiere retains**. **Correct FN-top / DX-bottom positioning is OUT OF SCOPE** for this phase and will be tackled separately.
+
+**Native-only (no transcode fallback).** Decided 2026-05-30: the team *always* auto-generates `.srt` backups from the `.ass`/`.dfxp`, so a transcode-DFXP→SRT fallback would only reproduce a positionless track identical to importing that existing SRT — pure duplication. Therefore the only reason to ingest DFXP natively is to **preserve position data**, and the fallback for "native impossible" is simply: import the existing SRT backup via the path that already works (outside this tool). No cue parser, no temp-SRT generation in the tool.
 
 ## Problem
 
@@ -19,18 +21,15 @@ Established facts (this session, Premiere Pro 2025, live test project `Claude_Te
 
 1. One `create_caption_track` call places a `.dfxp` **or** `.xml` item onto a caption track that **renders** in the Program monitor.
 2. `.srt` ingestion continues to work unchanged (no regression).
-3. The tool response reports which internal strategy succeeded (`native` vs `transcode-srt`) so the caller knows whether positioning data was preserved.
+3. If native ingest of a DFXP/XML item proves impossible via ExtendScript, the tool returns a clear, actionable error (e.g. "DFXP/XML not natively attachable; import the .srt backup instead") rather than a cryptic `Illegal Parameter type`.
 
-Non-goals this phase: correct top/bottom positioning; `.itt`/`.ttml` extension import; caption read-back (Adobe API can't).
+Non-goals this phase: correct top/bottom positioning; `.itt`/`.ttml` extension import; caption read-back (Adobe API can't); any transcode/cue-parsing fallback.
 
-## Approach: Staged A→B with automatic, transparent fallback
+## Approach: native ingest only
 
-`create_caption_track` detects caption file type and tries two strategies in order; a single call always yields a track if either path works.
+`create_caption_track` detects a DFXP/XML (Transcript-type) item and uses the native ExtendScript caption-attach call that accepts it directly — preserving whatever positioning Premiere retains. The exact call is TBD by the spike (below). `.srt` continues through its existing working path unchanged.
 
-- **Strategy A — native (preferred):** make ExtendScript's caption-attach accept the Transcript-type item directly. Preserves whatever positioning Premiere retains. Exact call TBD by the spike (below).
-- **Strategy B — transcode fallback (guaranteed):** parse the DFXP/XML cues (begin/end/text), write a temp `.srt` into the same lucid folder as the source, and run the existing proven SRT ingest path. Loses positioning, but guarantees the feature ships.
-
-**Fallback is automatic but TRANSPARENT:** the call falls back A→B on its own (caller always gets a track in one call), and the response includes `strategy: "native" | "transcode-srt"` (+ a human note). Per user (2026-05-30): option A = automatic fallback, surfaced in the response — not silent, not refuse-and-stop.
+There is **no transcode fallback** (see scope note): if native attach is impossible, the tool reports that clearly and the operator imports the always-present `.srt` backup via the existing SRT path. The response indicates the source format handled (`srt` / `dfxp` / `xml`) for clarity.
 
 ## The spike (de-risks Strategy A without N rebuilds)
 
@@ -43,7 +42,7 @@ There is no generic raw-ExtendScript tool, so probing the live caption API would
 
 Then bake the working call into `createCaptionTrack` as Strategy A and **delete `debug_eval_script`** before shipping. It never lands in the committed feature.
 
-If the spike proves **no** ExtendScript path accepts a Transcript item → Strategy A is impossible; ship Strategy B alone (still meets the success criteria, minus positioning). Either way the phase delivers a working DFXP/XML ingest.
+If the spike proves **no** ExtendScript path accepts a Transcript item → native ingest is impossible; this phase ships only the improved error message (success criterion #3), and DFXP positioning waits for a future UXP-native or positioning-focused phase. The operator is no worse off — the `.srt` backup already covers the positionless case.
 
 ## Build / run / reconnect loop
 
@@ -52,6 +51,7 @@ If the spike proves **no** ExtendScript path accepts a Transcript item → Strat
 - **All edits + `npm run build` happen in that main repo checkout.** (This spec lives there too.)
 - `npm run build` (tsc → `dist/`) updates the bundle, but the running server only picks it up when **Claude Code reconnects the MCP** — a manual step the user performs.
 - **Reconnect cadence:** user is at the machine and happy to restart as needed (~2 reconnects expected: one after adding `debug_eval_script`, one after baking in the fix + removing it). Optimize for debugging speed, not minimizing restarts.
+- **CONCURRENCY GATE (critical):** a second session is also editing this MCP (track-muting feature) on the same branch/file/dist/server/Premiere. These share four singular resources (`src/tools/index.ts`, `dist/`, the one running server, the one Premiere + `/tmp/premiere-mcp-bridge`). **Before any `npm run build`, confirm the other session has NO uncommitted edits to `src/tools/index.ts`** — otherwise the build captures its half-finished code. Plan: user parks the muting session; captions feature runs live now and commits; muting resumes after. Do not run both live loops simultaneously.
 
 ## Testing & verification
 
