@@ -50,14 +50,12 @@
 ```typescript
       {
         name: 'debug_eval_script',
-        description: 'TEMPORARY DEالبUG TOOL — runs raw ExtendScript in the Premiere host and returns its result. Remove before shipping.',
+        description: 'TEMPORARY DEBUG TOOL — runs raw ExtendScript in the Premiere host and returns its result. Remove before shipping.',
         inputSchema: z.object({
           script: z.string().describe('Raw ExtendScript body. Use JSON.stringify(...) as the return value.')
         })
       },
 ```
-
-> NOTE: fix the typo `DEالبUG` → `DEBUG` when typing (placeholder to force you to read this line). The string must read `TEMPORARY DEBUG TOOL`.
 
 - [ ] **Step 2: Add the dispatch case.** Find `case 'create_caption_track':`. Immediately BEFORE it, insert:
 
