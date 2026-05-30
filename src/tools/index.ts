@@ -934,7 +934,7 @@ export class PremiereProTools {
       // Captions
       {
         name: 'create_caption_track',
-        description: 'Creates a caption track on a sequence from an imported caption/subtitle file (e.g. an .srt imported via import_media). Pass the SRT project item ID directly.',
+        description: 'Creates a caption track on a sequence from an imported caption/subtitle item. Accepts .srt (subtitle) and TTML-family sidecars imported as .dfxp or .xml (DFXP/SMPTE-TT; the .itt/.ttml extensions are rejected by Premiere import, so use .dfxp/.xml). Import the file via import_media first, then pass its projectItemId. NOTE: .dfxp/.xml carry region positioning, but whether Premiere honors top/bottom on import is unconfirmed; .srt carries no positioning.',
         inputSchema: z.object({
           sequenceId: z.string().describe('The ID of the sequence'),
           projectItemId: z.string().describe('The ID of the caption file project item (e.g. an imported .srt)'),
