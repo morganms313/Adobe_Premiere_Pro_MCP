@@ -102,6 +102,15 @@ else
   warn "claude-dotfiles/link.sh not found — skipping config link."
 fi
 
+# ---- 5b. Skill runtime deps (cr-image-subtitles QA scripts) ----------------
+# The image-sub QA scripts (subcheck/fncheck/fntiming/imgeval/...) need Pillow +
+# numpy, and a local vision model served by ollama (qwen2.5vl baseline).
+step "Skill runtime deps: ollama, tesseract, Python Pillow/numpy"
+brew list ollama >/dev/null 2>&1    || brew install ollama
+brew list tesseract >/dev/null 2>&1 || brew install tesseract
+python3 -m pip install --quiet --upgrade pip pillow numpy || \
+  warn "pip install pillow/numpy failed — install into your preferred Python env manually."
+
 # ---- 6. Build + install the Premiere MCP bridge ----------------------------
 step "Building MCP server + installing CEP bridge"
 npm run setup:mac --prefix "$MCP_REPO_DIR"
@@ -126,6 +135,10 @@ cat <<'EOF'
         (run: claude mcp list   to see auth status)
   [ ] Mount + sign into Lucid cloud storage (the fast-pipe payoff)
   [ ] Copy local brand assets not in git: ~/Downloads/CR_NoReg_Review/ etc.
+  [ ] Pull the vision model(s) for the image-sub QA skill (multi-GB — the fast
+      office pipe makes this quick):
+        ollama serve &            # if not already running as a service
+        ollama pull qwen2.5vl:7b  # baseline; optionally also qwen3-vl:8b
 
   Optional — to use the mini as a REMOTE render/upload node later:
   [ ] System Settings > General > Sharing: enable Screen Sharing + Remote Login
