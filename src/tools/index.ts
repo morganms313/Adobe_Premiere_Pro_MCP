@@ -368,15 +368,15 @@ export class PremiereProTools {
       },
       {
         name: 'crop_clip',
-        description: 'Crops a clip\'s frame using Premiere\'s built-in Crop video effect, trimming the picture edges inward by a percentage on each side (Left/Right/Top/Bottom, 0-100). Useful for removing letterbox/pillarbox bars, hiding edge artifacts or burned-in elements, and reframing. Note: each call adds a new Crop effect instance to the clip rather than updating an existing one — call remove_effect with effectName "Crop" first if you need to reset.',
+        description: 'Crops a timeline clip using Premiere Pro\'s built-in Crop video effect, trimming the picture edges inward by a percentage on each side (Left/Right/Top/Bottom, 0-100). Useful for removing letterbox/pillarbox bars, hiding edge artifacts or burned-in elements, and reframing. Reuses an existing Crop effect on the clip when present; otherwise adds one. Omitted parameters keep their current/default values.',
         inputSchema: z.object({
-          clipId: z.string().describe('The ID of the timeline clip to crop'),
-          left: z.number().optional().describe('Percent to crop from the left edge (0-100)'),
-          right: z.number().optional().describe('Percent to crop from the right edge (0-100)'),
-          top: z.number().optional().describe('Percent to crop from the top edge (0-100)'),
-          bottom: z.number().optional().describe('Percent to crop from the bottom edge (0-100)'),
-          zoom: z.boolean().optional().describe('Crop effect Zoom toggle: when true, scales the cropped image back up to fill the frame instead of leaving the cropped area empty'),
-          edgeFeather: z.number().optional().describe('Edge Feather amount in pixels to soften the crop edges (default 0)')
+          clipId: z.string().describe('The ID of the timeline video clip to crop'),
+          left: z.number().min(0).max(100).optional().describe('Percent to crop from the left edge (0-100)'),
+          right: z.number().min(0).max(100).optional().describe('Percent to crop from the right edge (0-100)'),
+          top: z.number().min(0).max(100).optional().describe('Percent to crop from the top edge (0-100)'),
+          bottom: z.number().min(0).max(100).optional().describe('Percent to crop from the bottom edge (0-100)'),
+          zoom: z.boolean().optional().describe('Crop effect Zoom toggle: scales the cropped image back up to fill the frame'),
+          edgeFeather: z.number().min(0).optional().describe('Edge Feather amount in pixels')
         })
       },
       {
@@ -582,10 +582,10 @@ export class PremiereProTools {
       },
       {
         name: 'delete_track',
-        description: 'Deletes a track from the sequence.',
+        description: 'Deletes a video or audio track from the sequence. Caption track deletion is accepted by the schema but returns an explicit unsupported result because Premiere Pro exposes no caption-track delete/read API to scripting.',
         inputSchema: z.object({
           sequenceId: z.string().describe('The ID of the sequence'),
-          trackType: z.enum(['video', 'audio']).describe('Type of track'),
+          trackType: z.enum(['video', 'audio', 'caption']).describe('Type of track'),
           trackIndex: z.number().describe('The index of the track to delete')
         })
       },
@@ -2124,10 +2124,15 @@ export class PremiereProTools {
         ...result
       };
     } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const maybeModalTimeout = /timeout|timed out/i.test(message);
       return {
         success: false,
-        error: `Failed to import media: ${error instanceof Error ? error.message : String(error)}`,
-        filePath: filePath
+        error: `Failed to import media: ${message}`,
+        filePath: filePath,
+        ...(maybeModalTimeout ? {
+          warning: 'Premiere may be showing a blocking modal dialog, such as "File format not supported". Dismiss the dialog in Premiere, then retry. For subtitle files, convert unsupported formats like .ass/.ssa to .srt before importing.'
+        } : {})
       };
     }
   }
@@ -2843,11 +2848,39 @@ export class PremiereProTools {
           effect = qe.project.getAudioEffectByName("${effectName}");
         }
         if (!effect) return JSON.stringify({ success: false, error: "Effect not found: ${effectName}. Use list_available_effects to see available effects." });
-        var qeClip = qeTrack.getItemAt(info.clipIndex);
+        function findQeClipByTime() {
+          var targetTicks = String(info.clip.start.ticks);
+          var best = null;
+          var bestDelta = null;
+          for (var qi = 0; qi < qeTrack.numItems; qi++) {
+            var item = qeTrack.getItemAt(qi);
+            if (!item || String(item.type) !== "Clip") continue;
+            var itemTicks = String(item.start.ticks);
+            if (itemTicks === targetTicks) return item;
+            var delta = Math.abs(parseInt(itemTicks, 10) - parseInt(targetTicks, 10));
+            if (best === null || delta < bestDelta) {
+              best = item;
+              bestDelta = delta;
+            }
+          }
+          return best;
+        }
+        var qeClip = findQeClipByTime();
+        if (!qeClip) return JSON.stringify({ success: false, error: "Could not locate matching QE clip for effect application" });
         if (info.trackType === 'video') { qeClip.addVideoEffect(effect); } else { qeClip.addAudioEffect(effect); }
 
         // Find the newly added component (last in the array)
         var afterCount = clip.components.numItems;
+        if (afterCount <= beforeCount) {
+          return JSON.stringify({
+            success: false,
+            error: "Effect add did not create a new component on the target clip",
+            clipId: "${clipId}",
+            effectName: "${effectName}",
+            beforeComponentCount: beforeCount,
+            afterComponentCount: afterCount
+          });
+        }
         var newCompIdx = afterCount - 1;
         var newComp = clip.components[newCompIdx];
 
@@ -2912,8 +2945,13 @@ export class PremiereProTools {
           }
         }
 
+        var failedParams = [];
+        for (var pr = 0; pr < paramResults.length; pr++) {
+          if (!paramResults[pr].ok) failedParams.push(paramResults[pr]);
+        }
+
         return JSON.stringify({
-          success: true,
+          success: failedParams.length === 0,
           message: "Effect applied",
           clipId: "${clipId}",
           effectName: "${effectName}",
@@ -2923,7 +2961,8 @@ export class PremiereProTools {
             propertyCount: propsDump.length,
             properties: propsDump
           },
-          paramResults: paramResults
+          paramResults: paramResults,
+          error: failedParams.length ? "One or more effect parameters could not be set" : undefined
         });
       } catch (e) {
         return JSON.stringify({ success: false, error: "QE DOM error: " + e.toString() });
@@ -2934,19 +2973,178 @@ export class PremiereProTools {
   }
 
   private async cropClip(clipId: string, options: { left?: number; right?: number; top?: number; bottom?: number; zoom?: boolean; edgeFeather?: number }): Promise<any> {
-    // Premiere's "Crop" video effect exposes Left/Top/Right/Bottom (percent 0-100),
-    // a Zoom toggle, and Edge Feather (pixels). Delegate to applyEffect, which adds
-    // the Crop effect via the QE DOM and sets each property by display-name — the
-    // same path verified to set all four crop edges correctly.
-    const opts = options || {};
     const params: Record<string, any> = {};
-    if (opts.left !== undefined) params['Left'] = opts.left;
-    if (opts.top !== undefined) params['Top'] = opts.top;
-    if (opts.right !== undefined) params['Right'] = opts.right;
-    if (opts.bottom !== undefined) params['Bottom'] = opts.bottom;
-    if (opts.zoom !== undefined) params['Zoom'] = opts.zoom;
-    if (opts.edgeFeather !== undefined) params['Edge Feather'] = opts.edgeFeather;
-    return await this.applyEffect(clipId, 'Crop', params);
+    if (options.left !== undefined) params['Left'] = options.left;
+    if (options.top !== undefined) params['Top'] = options.top;
+    if (options.right !== undefined) params['Right'] = options.right;
+    if (options.bottom !== undefined) params['Bottom'] = options.bottom;
+    if (options.zoom !== undefined) params['Zoom'] = options.zoom;
+    if (options.edgeFeather !== undefined) params['Edge Feather'] = options.edgeFeather;
+
+    const paramJson = JSON.stringify(params);
+    const script = `
+      try {
+        app.enableQE();
+        var info = __findClip(${JSON.stringify(clipId)});
+        if (!info) return JSON.stringify({ success: false, error: "Clip not found" });
+        if (info.trackType !== "video") return JSON.stringify({ success: false, error: "crop_clip only supports video clips" });
+
+        var clip = info.clip;
+        var cropComp = null;
+        var cropCompIdx = -1;
+
+        function isCropComponent(component) {
+          return String(component.displayName) === "Crop" || String(component.matchName) === "AE.ADBE AECrop";
+        }
+
+        function findCropComponent() {
+          for (var i = clip.components.numItems - 1; i >= 0; i--) {
+            var component = clip.components[i];
+            if (isCropComponent(component)) {
+              cropComp = component;
+              cropCompIdx = i;
+              return true;
+            }
+          }
+          return false;
+        }
+
+        var effectAdded = false;
+        if (!findCropComponent()) {
+          var qeSeq = qe.project.getActiveSequence();
+          if (!qeSeq) return JSON.stringify({ success: false, error: "QE active sequence not available" });
+          var qeTrack = qeSeq.getVideoTrackAt(info.trackIndex);
+          if (!qeTrack) return JSON.stringify({ success: false, error: "QE video track not found for clip" });
+          var effect = qe.project.getVideoEffectByName("Crop");
+          if (!effect) return JSON.stringify({ success: false, error: "Crop effect not found. Use list_available_effects to inspect installed effects." });
+
+          function findQeClipByTime() {
+            var targetTicks = String(info.clip.start.ticks);
+            var best = null;
+            var bestDelta = null;
+            for (var qi = 0; qi < qeTrack.numItems; qi++) {
+              var item = qeTrack.getItemAt(qi);
+              if (!item || String(item.type) !== "Clip") continue;
+              var itemTicks = String(item.start.ticks);
+              if (itemTicks === targetTicks) return item;
+              var delta = Math.abs(parseInt(itemTicks, 10) - parseInt(targetTicks, 10));
+              if (best === null || delta < bestDelta) {
+                best = item;
+                bestDelta = delta;
+              }
+            }
+            return best;
+          }
+
+          var beforeCount = clip.components.numItems;
+          var qeClip = findQeClipByTime();
+          if (!qeClip) return JSON.stringify({ success: false, error: "Could not locate matching QE clip for Crop effect" });
+          qeClip.addVideoEffect(effect);
+          if (clip.components.numItems <= beforeCount) {
+            return JSON.stringify({
+              success: false,
+              error: "Crop effect add did not create a new component on the target clip",
+              beforeComponentCount: beforeCount,
+              afterComponentCount: clip.components.numItems
+            });
+          }
+          effectAdded = true;
+          if (!findCropComponent()) {
+            var addedNames = [];
+            for (var ai = beforeCount; ai < clip.components.numItems; ai++) {
+              addedNames.push(String(clip.components[ai].displayName));
+            }
+            return JSON.stringify({
+              success: false,
+              error: "Effect add completed but the new component was not Crop",
+              addedComponents: addedNames
+            });
+          }
+        }
+
+        var requestedParams = ${paramJson};
+        var paramResults = [];
+        function normalize(s) { return String(s).toLowerCase().replace(/[\\s_-]+/g, ''); }
+        for (var pName in requestedParams) {
+          if (requestedParams.hasOwnProperty && !requestedParams.hasOwnProperty(pName)) continue;
+          var requestedVal = requestedParams[pName];
+          var matched = null;
+          for (var k = 0; k < cropComp.properties.numItems; k++) {
+            if (String(cropComp.properties[k].displayName) === pName) {
+              matched = { prop: cropComp.properties[k], strategy: "exact" };
+              break;
+            }
+          }
+          if (!matched) {
+            var nameN = normalize(pName);
+            for (var nk = 0; nk < cropComp.properties.numItems; nk++) {
+              if (normalize(String(cropComp.properties[nk].displayName)) === nameN) {
+                matched = { prop: cropComp.properties[nk], strategy: "normalized" };
+                break;
+              }
+            }
+          }
+          if (!matched) {
+            paramResults.push({ requestedName: pName, ok: false, error: "no Crop property matches this displayName" });
+            continue;
+          }
+          try {
+            var valueBefore = null;
+            try { valueBefore = matched.prop.getValue(); } catch (eB) {}
+            matched.prop.setValue(requestedVal, true);
+            var valueAfter = null;
+            try { valueAfter = matched.prop.getValue(); } catch (eA) {}
+            var clamped = false;
+            if (typeof valueAfter === "number" && typeof requestedVal === "number") {
+              clamped = Math.abs(valueAfter - requestedVal) > 0.0001;
+            } else {
+              clamped = valueAfter !== requestedVal;
+            }
+            paramResults.push({
+              requestedName: pName,
+              matchedDisplayName: String(matched.prop.displayName),
+              strategy: matched.strategy,
+              valueRequested: requestedVal,
+              valueBefore: valueBefore,
+              valueAfter: valueAfter,
+              clamped: clamped,
+              ok: true
+            });
+          } catch (eSet) {
+            paramResults.push({ requestedName: pName, ok: false, error: "setValue threw: " + eSet.toString() });
+          }
+        }
+
+        var propsDump = [];
+        for (var pi = 0; pi < cropComp.properties.numItems; pi++) {
+          var prop = cropComp.properties[pi];
+          var val = null;
+          try { val = prop.getValue(); } catch (eVal) { val = "<getValue threw: " + eVal.toString() + ">"; }
+          propsDump.push({ index: pi, displayName: String(prop.displayName), value: val });
+        }
+
+        var failedParams = [];
+        for (var pr = 0; pr < paramResults.length; pr++) {
+          if (!paramResults[pr].ok) failedParams.push(paramResults[pr]);
+        }
+
+        return JSON.stringify({
+          success: failedParams.length === 0,
+          message: effectAdded ? "Crop effect applied" : "Existing Crop effect updated",
+          clipId: ${JSON.stringify(clipId)},
+          effectName: "Crop",
+          effectAdded: effectAdded,
+          componentIndex: cropCompIdx,
+          properties: propsDump,
+          paramResults: paramResults,
+          error: failedParams.length ? "One or more Crop parameters could not be set" : undefined
+        });
+      } catch (e) {
+        return JSON.stringify({ success: false, error: "Crop effect failed: " + e.toString() });
+      }
+    `;
+
+    return await this.bridge.executeScript(script);
   }
 
   private async removeEffect(clipId: string, effectName: string): Promise<any> {
@@ -4112,13 +4310,26 @@ export class PremiereProTools {
   }
 
   private async deleteTrack(_sequenceId: string, trackType: string, trackIndex: number): Promise<any> {
+    if (trackType === 'caption') {
+      return {
+        success: false,
+        error: 'Caption track deletion is not supported by Premiere Pro scripting. The ExtendScript DOM exposes no sequence.captionTracks/getCaptionTracks surface, and the QE DOM exposes no caption-track accessor or delete method.',
+        sequenceId: _sequenceId,
+        trackType,
+        trackIndex,
+        unsupportedByPremiereApi: true,
+        workaround: 'Delete caption tracks manually in Premiere, or remove/recreate captions from the source .srt before creating the caption track.'
+      };
+    }
+
     const script = `
       try {
-        var sequence = app.project.activeSequence;
+        var sequence = __findSequence(${JSON.stringify(_sequenceId)});
+        if (!sequence) sequence = app.project.activeSequence;
         if (!sequence) {
           return JSON.stringify({
             success: false,
-            error: "No active sequence"
+            error: "Sequence not found"
           });
         } else {
           var tracks = ${trackType === 'video' ? 'sequence.videoTracks' : 'sequence.audioTracks'};
