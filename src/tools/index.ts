@@ -320,11 +320,11 @@ export class PremiereProTools {
       },
       {
         name: 'move_clip',
-        description: 'Moves a clip to a different position on the timeline.',
+        description: 'Moves a clip to a new time position, and optionally to a different track (same media type). A cross-track move preserves the clip\'s exact trimmed in/out and duration (including still-image custom durations) and refuses to overwrite an occupied destination span. A linked audio/video counterpart is not relocated.',
         inputSchema: z.object({
           clipId: z.string().describe('The ID of the clip to move'),
           newTime: z.number().describe('The new time position in seconds'),
-          newTrackIndex: z.number().optional().describe('The new track index (if moving to different track)')
+          newTrackIndex: z.number().optional().describe('Target track index (same media type as the clip). Omit, or set equal to the current track, for a time-only move. A cross-track move fails if the destination span is already occupied.')
         })
       },
       {
@@ -2628,22 +2628,141 @@ export class PremiereProTools {
     return await this.bridge.executeScript(script);
   }
 
-  private async moveClip(clipId: string, newTime: number, _newTrackIndex?: number): Promise<any> {
+  private async moveClip(clipId: string, newTime: number, newTrackIndex?: number): Promise<any> {
+    const clipArg = JSON.stringify(clipId);
+    const trackArg = (newTrackIndex === undefined || newTrackIndex === null) ? 'null' : String(newTrackIndex);
     const script = `
       try {
-        var info = __findClip("${clipId}");
+        var info = __findClip(${clipArg});
         if (!info) return JSON.stringify({ success: false, error: "Clip not found" });
         var clip = info.clip;
+        var seq = info.sequence;
+        var srcTrackIndex = info.trackIndex;
+        var trackType = info.trackType;
         var oldTime = clip.start.seconds;
-        var shiftAmount = ${newTime} - oldTime;
-        clip.move(shiftAmount);
+        var requestedTrack = ${trackArg};
+
+        // Same-track (or unspecified track) request: pure time shift, original behavior.
+        if (requestedTrack === null || requestedTrack === srcTrackIndex) {
+          clip.move(${newTime} - oldTime);
+          return JSON.stringify({
+            success: true,
+            message: "Clip moved successfully",
+            clipId: ${clipArg},
+            oldTime: oldTime,
+            newTime: ${newTime},
+            trackIndex: srcTrackIndex,
+            newTrackIndex: srcTrackIndex,
+            trackChanged: false
+          });
+        }
+
+        // Cross-track move. Premiere's DOM has no "move clip to another track" call, so we
+        // re-place the source media on the target track preserving the exact trimmed in/out
+        // (critical for still images with custom on-screen durations), then remove the original.
+        var tracks = (trackType === "video") ? seq.videoTracks : seq.audioTracks;
+        if (requestedTrack < 0 || requestedTrack >= tracks.numTracks) {
+          return JSON.stringify({
+            success: false,
+            error: "Target " + trackType + " track index " + requestedTrack + " is out of range",
+            trackType: trackType,
+            trackCount: tracks.numTracks
+          });
+        }
+        var targetTrack = tracks[requestedTrack];
+
+        var srcIn = clip.inPoint.seconds;
+        var srcOut = clip.outPoint.seconds;
+        var srcDur = clip.duration.seconds;
+        var pItem = clip.projectItem;
+        if (!pItem) {
+          return JSON.stringify({ success: false, error: "Source clip has no projectItem; cannot relocate it across tracks" });
+        }
+
+        var targetTime = ${newTime};
+        var EPS = 0.001;
+
+        // Refuse to clobber: bail if anything already occupies the destination span on the
+        // target track. Overwriting silently is how the original no-op bug caused data loss.
+        var lastEnd = 0;
+        for (var i = 0; i < targetTrack.clips.numItems; i++) {
+          var ex = targetTrack.clips[i];
+          var exS = ex.start.seconds;
+          var exE = ex.end.seconds;
+          if (exE > lastEnd) lastEnd = exE;
+          if (exS < targetTime + srcDur - EPS && exE > targetTime + EPS) {
+            return JSON.stringify({
+              success: false,
+              error: "Destination span on track " + requestedTrack + " is occupied; refusing to overwrite. Clear the destination or choose another time/track.",
+              occupiedBy: ex.name,
+              occupiedStart: exS,
+              occupiedEnd: exE,
+              requestedStart: targetTime,
+              requestedDuration: srcDur
+            });
+          }
+        }
+
+        // Place onto empty space past the last clip first (overwriteClip uses the project
+        // item's default duration, which for stills can exceed srcDur and would otherwise
+        // clobber neighbors), trim to the exact source in/out, then slide into the verified-
+        // empty destination span.
+        var tempTime = lastEnd + 1.0;
+        targetTrack.overwriteClip(pItem, tempTime);
+
+        var placed = null;
+        for (var j = 0; j < targetTrack.clips.numItems; j++) {
+          var cand = targetTrack.clips[j];
+          if (cand && cand.projectItem && cand.projectItem.nodeId === pItem.nodeId && Math.abs(cand.start.seconds - tempTime) < 0.2) {
+            placed = cand;
+            break;
+          }
+        }
+        if (!placed) {
+          return JSON.stringify({ success: false, error: "Failed to place clip on target track " + requestedTrack });
+        }
+
+        // Restore exact source trim. Order the assignments so inPoint never transiently
+        // exceeds outPoint (which the DOM rejects).
+        if (srcIn <= placed.outPoint.seconds) {
+          placed.inPoint = new Time(srcIn + "s");
+          placed.outPoint = new Time(srcOut + "s");
+        } else {
+          placed.outPoint = new Time(srcOut + "s");
+          placed.inPoint = new Time(srcIn + "s");
+        }
+
+        // Slide into final position (verified empty above).
+        placed.move(targetTime - placed.start.seconds);
+
+        // Best-effort note: a linked audio/video counterpart is NOT relocated by this op.
+        var linkedNote = null;
+        try {
+          if (typeof clip.getLinkedItems === "function" && clip.getLinkedItems().numItems > 1) {
+            linkedNote = "Source clip had a linked audio/video counterpart; only the targeted clip was moved and the link was not preserved.";
+          }
+        } catch (le) {}
+
+        // Remove the original with a lift (ripple=false) so timing of other clips on the
+        // source track is preserved.
+        clip.remove(false, false);
+
         return JSON.stringify({
           success: true,
-          message: "Clip moved successfully",
-          clipId: "${clipId}",
+          message: "Clip moved to " + trackType + " track " + requestedTrack,
+          clipId: ${clipArg},
+          newClipId: placed.nodeId,
           oldTime: oldTime,
-          newTime: ${newTime},
-          trackIndex: info.trackIndex
+          newTime: placed.start.seconds,
+          fromTrackIndex: srcTrackIndex,
+          trackIndex: requestedTrack,
+          newTrackIndex: requestedTrack,
+          trackChanged: true,
+          trackType: trackType,
+          duration: placed.duration.seconds,
+          inPoint: placed.inPoint.seconds,
+          outPoint: placed.outPoint.seconds,
+          linkedNote: linkedNote
         });
       } catch (e) {
         return JSON.stringify({
