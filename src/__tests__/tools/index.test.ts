@@ -358,6 +358,95 @@ describe('PremiereProTools', () => {
       expect(mockBridge.executeScript).toHaveBeenCalledWith(expect.stringContaining('__findClip("clip-123", "seq-456")'));
       expect(mockBridge.executeScript).toHaveBeenCalledWith(expect.stringContaining('var isRipple = "lift" === "ripple";'));
     });
+
+    describe('move_clip', () => {
+      it('performs a same-track time-only move when newTrackIndex is omitted', async () => {
+        mockBridge.executeScript.mockResolvedValue({
+          success: true,
+          trackChanged: false,
+          newTrackIndex: 0,
+        });
+
+        const result = await tools.executeTool('move_clip', {
+          clipId: 'clip-123',
+          newTime: 5.5,
+        });
+
+        expect(result.success).toBe(true);
+        expect(result.trackChanged).toBe(false);
+
+        const script = mockBridge.executeScript.mock.calls[0][0];
+        // Track is unspecified → requestedTrack null → original clip.move() path.
+        expect(script).toContain('var requestedTrack = null;');
+        expect(script).toContain('clip.move(5.5 - oldTime);');
+        // clipId is JSON-encoded, not raw-interpolated.
+        expect(script).toContain('__findClip("clip-123")');
+      });
+
+      it('treats newTrackIndex equal to the current track as a time-only move at runtime', async () => {
+        mockBridge.executeScript.mockResolvedValue({ success: true, trackChanged: false });
+
+        await tools.executeTool('move_clip', {
+          clipId: 'clip-123',
+          newTime: 2,
+          newTrackIndex: 3,
+        });
+
+        const script = mockBridge.executeScript.mock.calls[0][0];
+        // The same-track short-circuit is decided in ExtendScript (requestedTrack === srcTrackIndex).
+        expect(script).toContain('var requestedTrack = 3;');
+        expect(script).toContain('requestedTrack === srcTrackIndex');
+      });
+
+      it('generates a cross-track relocation that preserves in/out and guards occupancy', async () => {
+        mockBridge.executeScript.mockResolvedValue({
+          success: true,
+          trackChanged: true,
+          newTrackIndex: 1,
+          duration: 2.377,
+        });
+
+        const result = await tools.executeTool('move_clip', {
+          clipId: 'clip-abc',
+          newTime: 1.5,
+          newTrackIndex: 1,
+        });
+
+        expect(result.success).toBe(true);
+        expect(result.trackChanged).toBe(true);
+        expect(result.newTrackIndex).toBe(1);
+
+        const script = mockBridge.executeScript.mock.calls[0][0];
+        expect(script).toContain('var requestedTrack = 1;');
+        // Occupancy guard — must refuse to overwrite, not silently clobber.
+        expect(script).toContain('Destination span');
+        expect(script).toContain('refusing to overwrite');
+        // Re-place on target track and restore the exact trimmed in/out.
+        expect(script).toContain('targetTrack.overwriteClip(pItem, tempTime);');
+        expect(script).toContain('placed.inPoint = new Time(srcIn + "s");');
+        expect(script).toContain('placed.outPoint = new Time(srcOut + "s");');
+        // Original is lifted (ripple=false) so the source track keeps its timing.
+        expect(script).toContain('clip.remove(false, false);');
+      });
+
+      it('surfaces an occupied-destination failure from the bridge instead of claiming success', async () => {
+        mockBridge.executeScript.mockResolvedValue({
+          success: false,
+          error: 'Destination span on track 1 is occupied; refusing to overwrite. Clear the destination or choose another time/track.',
+          occupiedBy: 'OSP_DX_0001.tif',
+        });
+
+        const result = await tools.executeTool('move_clip', {
+          clipId: 'clip-abc',
+          newTime: 1.5,
+          newTrackIndex: 1,
+        });
+
+        expect(result.success).toBe(false);
+        expect(result.error).toContain('occupied');
+        expect(result.occupiedBy).toBe('OSP_DX_0001.tif');
+      });
+    });
   });
 
   describe('high-level workflow tools', () => {
