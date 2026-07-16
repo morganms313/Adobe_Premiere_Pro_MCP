@@ -38,9 +38,11 @@ if [[ ! -f "$DIST_ENTRY" ]]; then
 fi
 
 echo "Enabling Adobe CEP debug mode..."
-defaults write com.adobe.CSXS.12 PlayerDebugMode 1
-defaults write com.adobe.CSXS.11 PlayerDebugMode 1
-defaults write com.adobe.CSXS.10 PlayerDebugMode 1
+# Enable for a range of CSXS runtimes so new Premiere releases keep working.
+# Premiere 2026 (26.x) uses CSXS.13; the upper bound leaves headroom for future versions.
+for csxs_version in $(seq 10 15); do
+  defaults write "com.adobe.CSXS.$csxs_version" PlayerDebugMode 1
+done
 
 echo "Installing Premiere CEP extension..."
 mkdir -p "$CEP_EXTENSIONS_DIR"

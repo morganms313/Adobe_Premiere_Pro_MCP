@@ -62,14 +62,25 @@ else
   fail "Bridge temp directory missing at $TEMP_DIR"
 fi
 
-for csxs_version in 12 11 10; do
+DEBUG_ENABLED=()
+DEBUG_MISSING=()
+for csxs_version in $(seq 10 15); do
   VALUE="$(defaults read "com.adobe.CSXS.$csxs_version" PlayerDebugMode 2>/dev/null || true)"
   if [[ "$VALUE" == "1" ]]; then
-    pass "Adobe CEP debug mode enabled for CSXS.$csxs_version"
+    DEBUG_ENABLED+=("$csxs_version")
   else
-    fail "Adobe CEP debug mode not enabled for CSXS.$csxs_version"
+    DEBUG_MISSING+=("$csxs_version")
   fi
 done
+if [[ ${#DEBUG_ENABLED[@]} -gt 0 ]]; then
+  pass "Adobe CEP debug mode enabled for CSXS.${DEBUG_ENABLED[*]// /, CSXS.}"
+else
+  fail "Adobe CEP debug mode not enabled for any CSXS runtime (10-15)"
+fi
+# Premiere 2026 (26.x) uses CSXS.13 — warn loudly if it is not enabled.
+if [[ " ${DEBUG_MISSING[*]} " == *" 13 "* ]]; then
+  fail "Adobe CEP debug mode not enabled for CSXS.13 (Premiere Pro 2026) — run: defaults write com.adobe.CSXS.13 PlayerDebugMode 1"
+fi
 
 if [[ -f "$CLAUDE_CONFIG_PATH" ]]; then
   CONFIG_CHECK="$(
