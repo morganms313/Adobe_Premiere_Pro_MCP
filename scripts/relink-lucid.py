@@ -12,7 +12,10 @@ This resolves the paths offline instead:
   1. an ordered PREFIX table handles the mechanical part of the move
      (everything below those prefixes survived the migration unchanged), then
   2. a basename index of the new filespaces catches assets that were actually
-     reshuffled.
+     reshuffled, then
+  3. Premiere's own stored offline verdict is cleared for whatever now resolves
+     — it trusts that verdict on the next open, so a corrected path alone still
+     comes up offline.
 
 Any absolute path that no longer resolves goes through this, not just old-space
 ones — projects touched since the migration carry paths into the new space that
@@ -252,6 +255,7 @@ class Resolver:
 # project rewriting
 
 MEDIA_BLOCK = re.compile(r"<Media\b.*?</Media>", re.DOTALL)
+OFFLINE_REASON = re.compile(r"\s*<OfflineReason>[^<]*</OfflineReason>")
 
 
 def read_project(path: str) -> tuple[str, bool]:
@@ -320,6 +324,12 @@ def process(project: str, resolver: Resolver, apply: bool) -> dict:
                 lambda _: f"<RelativePath>{escape(rel)}</RelativePath>",
                 block,
             )
+            # Premiere records its offline verdict in the project and trusts it
+            # on the next open — fixing the path is not enough, the item stays
+            # offline until the verdict is cleared. Only online media omits the
+            # element, so drop it now that this block points at a real file.
+            block, n = OFFLINE_REASON.subn("", block)
+            stats["cleared"] += n
         return block
 
     new_xml = MEDIA_BLOCK.sub(fix_block, xml)
@@ -367,7 +377,7 @@ def collect_projects(targets: list[str]) -> list[str]:
 
 
 ORDER = ["prefix", "index", "picked", "ambiguous", "nomatch",
-         "online", "skipped", "foreign"]
+         "online", "skipped", "foreign", "cleared"]
 
 
 def main() -> int:
