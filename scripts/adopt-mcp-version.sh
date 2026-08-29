@@ -92,6 +92,12 @@ case "${1:-status}" in
     git branch --show-current > "$DEST/BRANCH.txt"
     echo "    panel + dist + origin branch recorded"
 
+    CDCFG="$HOME/Library/Application Support/Claude/claude_desktop_config.json"
+    if [ -f "$CDCFG" ]; then
+      cp "$CDCFG" "$DEST/claude_desktop_config.json"
+      echo "    claude_desktop_config.json backed up — install-cep REWRITES it"
+    fi
+
     echo "==> switching to main"
     git rev-parse --verify -q main >/dev/null 2>&1 || git checkout -b main --track origin/main
     git checkout main
@@ -100,11 +106,49 @@ case "${1:-status}" in
     npm run build
     node dist/cli.js --install-cep
 
+    # Telemetry is default-ON from v1.2.4, and telling the operator to
+    # `export DO_NOT_TRACK=1` does NOTHING: the MCP server is launched by Claude
+    # Desktop from claude_desktop_config.json, which carries its own env block that
+    # a shell export never reaches. Write it there instead of advising it.
+    #
+    # DO_NOT_TRACK=1 ALONE is sufficient and cannot be self-defeating. Do NOT also
+    # set PREMIERE_MCP_TELEMETRY: per src/utils/telemetry.ts isTelemetryEnabled, an
+    # explicit PREMIERE_MCP_TELEMETRY short-circuits BEFORE DO_NOT_TRACK is read, in
+    # both directions -- DO_NOT_TRACK=1 + PREMIERE_MCP_TELEMETRY=1 is telemetry ON.
+    # They are not additive; one outranks the other. Verified against the built
+    # v1.2.4 runtime 2026-08-29.
+    if [ -f "$CDCFG" ]; then
+      python3 - "$CDCFG" <<'PYEOF'
+import json, sys
+p = sys.argv[1]
+try:
+    d = json.load(open(p))
+except Exception as e:
+    print(f"    WARNING: could not parse the Claude Desktop config ({e}) — set DO_NOT_TRACK=1 by hand")
+    raise SystemExit(0)
+srv = d.get("mcpServers", {}).get("premiere-pro")
+if not isinstance(srv, dict):
+    print("    WARNING: no 'premiere-pro' entry in the Claude Desktop config — set DO_NOT_TRACK=1 by hand")
+    raise SystemExit(0)
+env = srv.setdefault("env", {})
+if env.get("DO_NOT_TRACK") == "1":
+    print("    telemetry: DO_NOT_TRACK=1 already set")
+else:
+    env["DO_NOT_TRACK"] = "1"
+    json.dump(d, open(p, "w"), indent=2)
+    print("    telemetry: DO_NOT_TRACK=1 written into claude_desktop_config.json")
+tv = env.get("PREMIERE_MCP_TELEMETRY")
+if tv is not None and str(tv).lower() not in ("0", "false", "off", "no"):
+    print(f"    *** WARNING: PREMIERE_MCP_TELEMETRY={tv} OVERRIDES DO_NOT_TRACK — telemetry is ON.")
+    print("        Remove it, or set it to 0.")
+PYEOF
+    fi
+
     echo
     echo "==> installed panel now: $(md5of "$PANEL/bridge-cep.js")"
-    echo "==> DONE. Two things before you use it:"
-    echo "    1. export DO_NOT_TRACK=1   (upstream v1.2.4 ships default-on telemetry)"
-    echo "    2. restart Premiere, then confirm the MCP panel loads"
+    echo "==> DONE."
+    echo "    1. restart Claude Desktop (its config changed) and Premiere"
+    echo "    2. confirm the panel loads: Window > Extensions > MCP Bridge (CEP)"
     echo "    Roll back with: bash scripts/adopt-mcp-version.sh rollback"
     ;;
 
@@ -128,6 +172,8 @@ case "${1:-status}" in
       echo "==> restoring backup $LAST"
       [ -d "$SRC/MCPBridgeCEP" ] && { rm -rf "$PANEL"; cp -R "$SRC/MCPBridgeCEP" "$PANEL"; }
       [ -d "$SRC/dist" ]        && { rm -rf dist;    cp -R "$SRC/dist" dist; }
+      CDCFG="$HOME/Library/Application Support/Claude/claude_desktop_config.json"
+      [ -f "$SRC/claude_desktop_config.json" ] && { cp "$SRC/claude_desktop_config.json" "$CDCFG"; echo "==> claude_desktop_config.json restored (restart Claude Desktop)"; }
       BR="$(cat "$SRC/BRANCH.txt" 2>/dev/null || echo main)"
       echo "==> returning repo to '$BR'"
       git checkout "$BR"
