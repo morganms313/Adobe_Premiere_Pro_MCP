@@ -119,8 +119,29 @@ case "${1:-status}" in
     # v1.2.4 runtime 2026-08-29.
     if [ -f "$CDCFG" ]; then
       python3 - "$CDCFG" <<'PYEOF'
-import json, sys
+import json, os, sys, tempfile
 p = sys.argv[1]
+
+def write_atomically(path, data):
+    """Serialise FIRST, then rename over the target.
+
+    `json.dump(d, open(path, "w"))` truncates the file before writing a byte, so an
+    interrupt, a full disk or a permissions error partway through leaves a truncated
+    config -- and this file carries the wiring for EVERY MCP server, not just
+    premiere-pro. Losing it surfaces later as "MCP is just gone" after a restart.
+    """
+    text = json.dumps(data, indent=2)          # can only fail before anything is touched
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)                   # atomic on the same filesystem
+    except BaseException:
+        try: os.unlink(tmp)
+        except OSError: pass
+        raise
 try:
     d = json.load(open(p))
 except Exception as e:
@@ -135,7 +156,7 @@ if env.get("DO_NOT_TRACK") == "1":
     print("    telemetry: DO_NOT_TRACK=1 already set")
 else:
     env["DO_NOT_TRACK"] = "1"
-    json.dump(d, open(p, "w"), indent=2)
+    write_atomically(p, d)
     print("    telemetry: DO_NOT_TRACK=1 written into claude_desktop_config.json")
 tv = env.get("PREMIERE_MCP_TELEMETRY")
 if tv is not None and str(tv).lower() not in ("0", "false", "off", "no"):
