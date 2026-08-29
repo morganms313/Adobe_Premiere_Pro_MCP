@@ -119,7 +119,7 @@ case "${1:-status}" in
     # v1.2.4 runtime 2026-08-29.
     if [ -f "$CDCFG" ]; then
       python3 - "$CDCFG" <<'PYEOF'
-import json, os, sys, tempfile
+import json, os, stat, sys, tempfile
 p = sys.argv[1]
 
 def write_atomically(path, data):
@@ -131,12 +131,22 @@ def write_atomically(path, data):
     premiere-pro. Losing it surfaces later as "MCP is just gone" after a restart.
     """
     text = json.dumps(data, indent=2)          # can only fail before anything is touched
+    # Same directory, or os.replace() is a cross-filesystem rename and silently
+    # stops being atomic.
     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".", suffix=".tmp")
     try:
         with os.fdopen(fd, "w") as f:
             f.write(text)
             f.flush()
             os.fsync(f.fileno())
+        # The replaced file inherits the TEMP's mode, and mkstemp is 0600. Both our
+        # configs happen to be 0600 already, so this changes nothing today -- carry
+        # the original mode across anyway so that stays true by construction rather
+        # than by coincidence, wherever this runs.
+        try:
+            os.chmod(tmp, stat.S_IMODE(os.stat(path).st_mode))
+        except OSError:
+            pass
         os.replace(tmp, path)                   # atomic on the same filesystem
     except BaseException:
         try: os.unlink(tmp)
