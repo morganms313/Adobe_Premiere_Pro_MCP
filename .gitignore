@@ -16,3 +16,6 @@ release-artifacts/
 
 # Worktrees
 .worktrees/
+
+# Local rollback snapshots written by scripts/adopt-mcp-version.sh
+.mcp-backups/

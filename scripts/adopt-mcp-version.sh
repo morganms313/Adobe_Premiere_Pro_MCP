@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# adopt-mcp-version.sh — switch the running Premiere MCP between builds, reversibly.
+#
+# The installed CEP panel is a COPY, not a symlink, so `install-cep` overwrites it
+# and the previous panel is only recoverable if you kept it. This backs it up first
+# and can put it back byte-for-byte.
+#
+#   bash scripts/adopt-mcp-version.sh status     # what is installed vs what is on main
+#   bash scripts/adopt-mcp-version.sh adopt      # back up, switch to main, build, install
+#   bash scripts/adopt-mcp-version.sh rollback   # restore the most recent backup
+#
+# Premiere must be CLOSED for adopt/rollback — it reads the panel at launch.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+REPO="$(pwd)"
+PANEL="$HOME/Library/Application Support/Adobe/CEP/extensions/MCPBridgeCEP"
+BACKUPS="$REPO/.mcp-backups"
+KNOWN_GOOD_PANEL="8a8cc33"   # 2026-05-16; matches the panel installed on the MBP
+
+md5of() { [ -f "$1" ] && md5 -q "$1" || echo "(absent)"; }
+
+case "${1:-status}" in
+  status)
+    echo "repo branch : $(git branch --show-current)  ($(git rev-parse --short HEAD))"
+    echo "dist built  : $([ -f dist/tools/index.js ] && date -r dist/tools/index.js '+%Y-%m-%d %H:%M' || echo '(not built)')"
+    echo "panel md5   : $(md5of "$PANEL/bridge-cep.js")"
+    echo "main   md5  : $(git show main:cep-plugin/bridge-cep.js | md5 -q)"
+    echo "known-good  : $(git show ${KNOWN_GOOD_PANEL}:cep-plugin/bridge-cep.js | md5 -q)  (${KNOWN_GOOD_PANEL})"
+    [ -d "$BACKUPS" ] && { echo "backups     :"; ls -1 "$BACKUPS" | sed 's/^/              /'; } || echo "backups     : (none)"
+    ;;
+
+  adopt)
+    pgrep -x "Adobe Premiere Pro" >/dev/null && { echo "REFUSING: Premiere is running. Quit it first."; exit 1; }
+    STAMP="$(date '+%Y%m%d-%H%M%S')"
+    DEST="$BACKUPS/$STAMP"
+    mkdir -p "$DEST"
+    echo "==> backing up to $DEST"
+    [ -d "$PANEL" ] && cp -R "$PANEL" "$DEST/MCPBridgeCEP"
+    [ -d dist ]     && cp -R dist "$DEST/dist"
+    git rev-parse HEAD > "$DEST/HEAD.txt"
+    git branch --show-current > "$DEST/BRANCH.txt"
+    echo "    panel + dist + origin branch recorded"
+
+    echo "==> switching to main"
+    git checkout main
+    npm install --silent
+    npm run build
+    node dist/cli.js --install-cep
+
+    echo
+    echo "==> installed panel now: $(md5of "$PANEL/bridge-cep.js")"
+    echo "==> DONE. Two things before you use it:"
+    echo "    1. export DO_NOT_TRACK=1   (upstream v1.2.4 ships default-on telemetry)"
+    echo "    2. restart Premiere, then confirm the MCP panel loads"
+    echo "    Roll back with: bash scripts/adopt-mcp-version.sh rollback"
+    ;;
+
+  rollback)
+    pgrep -x "Adobe Premiere Pro" >/dev/null && { echo "REFUSING: Premiere is running. Quit it first."; exit 1; }
+    LAST="$(ls -1 "$BACKUPS" 2>/dev/null | tail -1 || true)"
+    if [ -z "$LAST" ]; then
+      echo "No backup found. Falling back to the known-good panel from git (${KNOWN_GOOD_PANEL})."
+      git checkout "$KNOWN_GOOD_PANEL" -- cep-plugin/
+      npm run build || true
+      node dist/cli.js --install-cep || {
+        echo "install-cep failed; copying the panel by hand"
+        mkdir -p "$PANEL" && cp -R cep-plugin/. "$PANEL/"
+      }
+      git checkout HEAD -- cep-plugin/
+    else
+      SRC="$BACKUPS/$LAST"
+      echo "==> restoring backup $LAST"
+      [ -d "$SRC/MCPBridgeCEP" ] && { rm -rf "$PANEL"; cp -R "$SRC/MCPBridgeCEP" "$PANEL"; }
+      [ -d "$SRC/dist" ]        && { rm -rf dist;    cp -R "$SRC/dist" dist; }
+      BR="$(cat "$SRC/BRANCH.txt" 2>/dev/null || echo main)"
+      echo "==> returning repo to '$BR'"
+      git checkout "$BR"
+    fi
+    echo "==> panel now: $(md5of "$PANEL/bridge-cep.js")"
+    echo "==> restart Premiere."
+    ;;
+
+  *) echo "usage: $0 {status|adopt|rollback}"; exit 2 ;;
+esac
