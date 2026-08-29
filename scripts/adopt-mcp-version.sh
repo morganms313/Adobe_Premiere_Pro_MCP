@@ -19,6 +19,24 @@ KNOWN_GOOD_PANEL="8a8cc33"   # 2026-05-16; matches the panel installed on the MB
 
 md5of() { [ -f "$1" ] && md5 -q "$1" || echo "(absent)"; }
 
+# Identify a panel by CONTENT rather than by a hardcoded commit. KNOWN_GOOD_PANEL
+# below is an MBP-specific constant, and no hardcoded commit can be right on both
+# machines: the mini's installed panel is 4e6a2f5 (2026-05-21), five days NEWER
+# than the MBP's 8a8cc33 (2026-05-16). An md5 mismatch alone cannot tell you which
+# way round that is, so map the md5 back to its commit and print the date.
+identify_panel() {
+  local target="$1" c m
+  [ "$target" = "(absent)" ] && { echo "(absent)"; return 0; }
+  for c in $(git log --all --format=%H -- cep-plugin/bridge-cep.js); do
+    m="$(git show "${c}:cep-plugin/bridge-cep.js" 2>/dev/null | md5 -q)"
+    if [ "$m" = "$target" ]; then
+      git log -1 --format='%h (%ad) %s' --date=short "$c" | cut -c1-64
+      return 0
+    fi
+  done
+  echo "no commit matches — hand-modified, or predates this history"
+}
+
 # Resolve what "main" actually means. The authority is origin/main, NOT a local
 # `main`: a clone can be sitting ON a local `main` that is far behind, and
 # preferring that ref makes `status` compare the installed panel against a stale
@@ -42,10 +60,12 @@ case "${1:-status}" in
     echo "repo branch : $(git branch --show-current)  ($(git rev-parse --short HEAD))"
     echo "dist built  : $([ -f dist/tools/index.js ] && date -r dist/tools/index.js '+%Y-%m-%d %H:%M' || echo '(not built)')"
     echo "panel md5   : $(md5of "$PANEL/bridge-cep.js")"
+    echo "  = installed: $(identify_panel "$(md5of "$PANEL/bridge-cep.js")")"
     INSTALLED="$(md5of "$PANEL/bridge-cep.js")"
     MAINMD5="$(git show "${MAINREF}:cep-plugin/bridge-cep.js" | md5 -q)"
     echo "main   md5  : ${MAINMD5}   (${MAINREF} = $(git rev-parse --short "$MAINREF"))"
-    echo "known-good  : $(git show "${KNOWN_GOOD_PANEL}:cep-plugin/bridge-cep.js" 2>/dev/null | md5 -q || echo "(commit absent — fetch)")  (${KNOWN_GOOD_PANEL} = MBP panel; NOT a baseline on other machines)"
+    echo "  = main     : $(identify_panel "$MAINMD5")"
+    echo "known-good  : $(git show "${KNOWN_GOOD_PANEL}:cep-plugin/bridge-cep.js" 2>/dev/null | md5 -q || echo "(commit absent — fetch)")  (${KNOWN_GOOD_PANEL} = the MBP's panel — an MBP-specific constant, NOT a baseline elsewhere)"
     if git rev-parse --verify -q main >/dev/null 2>&1 && git rev-parse --verify -q origin/main >/dev/null 2>&1; then
       BEHIND="$(git rev-list --count main..origin/main 2>/dev/null || echo 0)"
       if [ "${BEHIND:-0}" -gt 0 ]; then
@@ -93,6 +113,9 @@ case "${1:-status}" in
     LAST="$(ls -1 "$BACKUPS" 2>/dev/null | tail -1 || true)"
     if [ -z "$LAST" ]; then
       echo "No backup found. Falling back to the known-good panel from git (${KNOWN_GOOD_PANEL})."
+      echo "WARNING: ${KNOWN_GOOD_PANEL} is the MBP's panel. On another machine this can be a DOWNGRADE —"
+      echo "         the mini's own panel is 4e6a2f5 (2026-05-21), newer than ${KNOWN_GOOD_PANEL} (2026-05-16)."
+      printf "         continue? [y/N] "; read -r ans; [ "${ans:-N}" = "y" ] || { echo "aborted"; exit 1; }
       git checkout "$KNOWN_GOOD_PANEL" -- cep-plugin/
       npm run build || true
       node dist/cli.js --install-cep || {
