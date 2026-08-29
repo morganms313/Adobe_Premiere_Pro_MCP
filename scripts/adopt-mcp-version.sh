@@ -19,19 +19,44 @@ KNOWN_GOOD_PANEL="8a8cc33"   # 2026-05-16; matches the panel installed on the MB
 
 md5of() { [ -f "$1" ] && md5 -q "$1" || echo "(absent)"; }
 
-# A clone sitting on some other branch may have no local `main` (the office mini
-# is on a June branch). Resolve to whichever ref actually exists so `status` works
-# anywhere, and fetch first so origin/main is not itself stale.
-MAINREF="$(git rev-parse --verify -q main >/dev/null 2>&1 && echo main || echo origin/main)"
-git rev-parse --verify -q "$MAINREF" >/dev/null 2>&1 || { echo "Neither 'main' nor 'origin/main' resolves here — run: git fetch origin"; exit 1; }
+# Resolve what "main" actually means. The authority is origin/main, NOT a local
+# `main`: a clone can be sitting ON a local `main` that is far behind, and
+# preferring that ref makes `status` compare the installed panel against a stale
+# tree and report a false MATCH — i.e. "nothing to adopt" when a new panel is
+# waiting. Measured on the office mini 2026-08-29: local main bcaebc9 (72 behind)
+# carried the same bridge-cep.js md5 as the installed panel, while origin/main
+# (v1.2.4) carried a different one.
+# The old comment claimed this fetched; it did not. Now it does, non-fatally.
+git fetch -q origin 2>/dev/null || echo "warning: could not fetch origin — refs below may be stale"
+if git rev-parse --verify -q origin/main >/dev/null 2>&1; then
+  MAINREF="origin/main"
+elif git rev-parse --verify -q main >/dev/null 2>&1; then
+  MAINREF="main"
+  echo "warning: no origin/main here — falling back to local 'main', which may be stale"
+else
+  echo "Neither 'origin/main' nor 'main' resolves here — run: git fetch origin"; exit 1
+fi
 
 case "${1:-status}" in
   status)
     echo "repo branch : $(git branch --show-current)  ($(git rev-parse --short HEAD))"
     echo "dist built  : $([ -f dist/tools/index.js ] && date -r dist/tools/index.js '+%Y-%m-%d %H:%M' || echo '(not built)')"
     echo "panel md5   : $(md5of "$PANEL/bridge-cep.js")"
-    echo "main   md5  : $(git show "${MAINREF}:cep-plugin/bridge-cep.js" | md5 -q)   (${MAINREF})"
-    echo "known-good  : $(git show "${KNOWN_GOOD_PANEL}:cep-plugin/bridge-cep.js" 2>/dev/null | md5 -q || echo "(commit absent — fetch)")  (${KNOWN_GOOD_PANEL} = MBP panel)"
+    INSTALLED="$(md5of "$PANEL/bridge-cep.js")"
+    MAINMD5="$(git show "${MAINREF}:cep-plugin/bridge-cep.js" | md5 -q)"
+    echo "main   md5  : ${MAINMD5}   (${MAINREF} = $(git rev-parse --short "$MAINREF"))"
+    echo "known-good  : $(git show "${KNOWN_GOOD_PANEL}:cep-plugin/bridge-cep.js" 2>/dev/null | md5 -q || echo "(commit absent — fetch)")  (${KNOWN_GOOD_PANEL} = MBP panel; NOT a baseline on other machines)"
+    if git rev-parse --verify -q main >/dev/null 2>&1 && git rev-parse --verify -q origin/main >/dev/null 2>&1; then
+      BEHIND="$(git rev-list --count main..origin/main 2>/dev/null || echo 0)"
+      if [ "${BEHIND:-0}" -gt 0 ]; then
+        echo "            NOTE local 'main' is ${BEHIND} behind origin/main and carries $(git show main:cep-plugin/bridge-cep.js | md5 -q) — do not read it as current"
+      fi
+    fi
+    if [ "$INSTALLED" = "$MAINMD5" ]; then
+      echo "verdict     : installed panel MATCHES ${MAINREF} — nothing to adopt"
+    else
+      echo "verdict     : installed panel DIFFERS from ${MAINREF} — 'adopt' would change it"
+    fi
     [ -d "$BACKUPS" ] && { echo "backups     :"; ls -1 "$BACKUPS" | sed 's/^/              /'; } || echo "backups     : (none)"
     ;;
 
