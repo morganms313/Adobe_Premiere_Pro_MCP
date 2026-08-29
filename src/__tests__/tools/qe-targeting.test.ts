@@ -155,7 +155,27 @@ describe('QE targeting, second pass', () => {
   });
 
   describe('move_clip', () => {
-    it('rejects a leftover newTrackIndex instead of dropping it', async () => {
+    /**
+     * DELIBERATE DIVERGENCE FROM UPSTREAM.
+     *
+     * Upstream dropped newTrackIndex from move_clip and made the schema .strict(),
+     * so passing it is an error; cross-track moves go to move_clip_to_track in
+     * expanded.ts. This fork keeps the option, because that replacement calls
+     * overwriteClip with the *projectItem*: it applies the item's default duration
+     * (for a still, longer than the trimmed clip) and overwrites whatever occupies
+     * the destination. Our path reads the source in/out first, parks the clip on
+     * empty space, restores the exact trim, and refuses an occupied destination.
+     * The behavioural contract is covered in index.test.ts > move_clip.
+     *
+     * Upstream's instinct was still right about the failure mode it feared: a
+     * caller passes newTrackIndex, gets success, and the clip never moves. That is
+     * what this test guards, one layer lower than a schema check. Merging upstream
+     * v1.2.4 reintroduced exactly that bug — the dispatch line auto-merged to the
+     * two-argument form while the schema and the ExtendScript both still honoured
+     * a third, so the argument was accepted and then dropped in transit, with no
+     * conflict raised. Confirmed to fail when that argument is removed again.
+     */
+    it('threads newTrackIndex through dispatch into the generated script', async () => {
       const bridge = { executeScript: jest.fn().mockResolvedValue({ success: true }) };
       const tools = new PremiereProTools(bridge as any);
 
@@ -163,8 +183,14 @@ describe('QE targeting, second pass', () => {
         clipId: 'c', newTime: 1, newTrackIndex: 3,
       });
 
-      expect(result.success).toBe(false);
-      expect(bridge.executeScript).not.toHaveBeenCalled();
+      expect(result.success).toBe(true);
+      expect(bridge.executeScript).toHaveBeenCalled();
+
+      // The requested track must reach ExtendScript as a value, not as null:
+      // null is the time-only path, which is what a dropped argument degrades to.
+      const script = bridge.executeScript.mock.calls[0][0] as string;
+      expect(script).toContain('var requestedTrack = 3;');
+      expect(script).not.toContain('var requestedTrack = null;');
     });
   });
 
