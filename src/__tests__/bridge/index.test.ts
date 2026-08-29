@@ -4,28 +4,37 @@
 
 import { PremiereProBridge } from '../../bridge/index.js';
 import { promises as fs } from 'fs';
+import path from 'path';
 
 jest.mock('fs', () => ({
   promises: {
     mkdir: jest.fn(),
     access: jest.fn(),
+    readdir: jest.fn(),
     writeFile: jest.fn(),
     readFile: jest.fn(),
     unlink: jest.fn(),
+    rename: jest.fn(),
     rm: jest.fn(),
   }
 }));
 
-jest.mock('uuid', () => ({
-  v4: jest.fn(() => 'test-uuid-1234')
+jest.mock('node:crypto', () => ({
+  randomUUID: jest.fn(() => 'test-uuid-1234')
 }));
 
 describe('PremiereProBridge', () => {
   const mockFs = fs as jest.Mocked<typeof fs>;
+  const configuredTempDir = '/tmp/premiere-mcp-bridge-test';
+  const commandPath = path.join(configuredTempDir, 'command-test-uuid-1234.json');
+  // The command is written to a scratch name and renamed into place, so the panel
+  // never sees a partially written command-*.json while polling the directory.
+  const stagingPath = path.join(configuredTempDir, '.tmp-test-uuid-1234.json');
+  const responsePath = path.join(configuredTempDir, 'response-test-uuid-1234.json');
 
   beforeEach(() => {
     jest.clearAllMocks();
-    process.env.PREMIERE_TEMP_DIR = '/tmp/premiere-mcp-bridge-test';
+    process.env.PREMIERE_TEMP_DIR = configuredTempDir;
   });
 
   afterEach(() => {
@@ -58,11 +67,13 @@ describe('PremiereProBridge', () => {
 
     expect(result).toEqual({ ok: true });
     expect(mockFs.writeFile).toHaveBeenCalledWith(
-      '/tmp/premiere-mcp-bridge-test/command-test-uuid-1234.json',
+      stagingPath,
       expect.stringContaining('return JSON.stringify')
     );
-    expect(mockFs.unlink).toHaveBeenCalledWith('/tmp/premiere-mcp-bridge-test/command-test-uuid-1234.json');
-    expect(mockFs.unlink).toHaveBeenCalledWith('/tmp/premiere-mcp-bridge-test/response-test-uuid-1234.json');
+    // Published atomically: visible under its real name only once fully written.
+    expect(mockFs.rename).toHaveBeenCalledWith(stagingPath, commandPath);
+    expect(mockFs.unlink).toHaveBeenCalledWith(commandPath);
+    expect(mockFs.unlink).toHaveBeenCalledWith(responsePath);
   });
 
   it('preserves self-invoking scripts instead of double-wrapping them', async () => {
@@ -77,11 +88,11 @@ describe('PremiereProBridge', () => {
     await bridge.executeScript('(function(){ return JSON.stringify({ ok: true }); })();');
 
     expect(mockFs.writeFile).toHaveBeenCalledWith(
-      '/tmp/premiere-mcp-bridge-test/command-test-uuid-1234.json',
+      stagingPath,
       expect.stringContaining('(function(){ return JSON.stringify({ ok: true }); })();')
     );
     expect(mockFs.writeFile).not.toHaveBeenCalledWith(
-      '/tmp/premiere-mcp-bridge-test/command-test-uuid-1234.json',
+      stagingPath,
       expect.stringContaining('(function(){\n(function(){ return JSON.stringify({ ok: true }); })();\n})();')
     );
   });
@@ -103,6 +114,55 @@ describe('PremiereProBridge', () => {
 
     expect(result.success).toBe(true);
     expect(result.id).toBe('item-123');
+    const command = mockFs.writeFile.mock.calls.find(([filePath]: [string]) => filePath.endsWith('.json'))?.[1] as string;
+    expect(command).toContain('alreadyImported: true');
+    expect(command).toContain('existingItem.getMediaPath() === file.fsName');
+  });
+
+  it('generates renderSequence JSX that selects the requested source range constant', async () => {
+    const bridge = new PremiereProBridge();
+    mockFs.mkdir.mockResolvedValue(undefined);
+    mockFs.access.mockRejectedValue(new Error('Not found'));
+    mockFs.writeFile.mockResolvedValue(undefined);
+    mockFs.readFile.mockResolvedValue(JSON.stringify({ success: true }));
+    mockFs.unlink.mockResolvedValue(undefined);
+
+    await bridge.initialize();
+    await bridge.renderSequence('seq-"quoted"', '/tmp/out.mp4', '/tmp/preset.epr', {
+      sourceRange: 'in_out',
+      removeOnCompletion: false,
+    });
+
+    const commandFile = JSON.parse(String(mockFs.writeFile.mock.calls[0]?.[1] ?? '{}'));
+    const command = String(commandFile.script ?? '');
+    expect(command).toContain('var sequenceId = "seq-\\"quoted\\""');
+    expect(command).toContain('encoderRangeConstant = "ENCODE_IN_TO_OUT"');
+    expect(command).toContain('encoderRangeConstant = "ENCODE_WORKAREA"');
+    expect(command).toContain('encoderRangeConstant = "ENCODE_ENTIRE"');
+    expect(command).toContain('var removeOnCompletion = 0;');
+    expect(command).toContain('app.encoder[encoderRangeConstant]');
+    expect(command).not.toContain('__findSequence("seq-"quoted"")');
+  });
+
+  it('blocks AME rendering before Premiere when Media Encoder is not installed', async () => {
+    const bridge = new PremiereProBridge();
+    const platformDescriptor = Object.getOwnPropertyDescriptor(process, 'platform');
+    mockFs.mkdir.mockResolvedValue(undefined);
+    mockFs.access.mockRejectedValue(new Error('Not found'));
+    mockFs.readdir.mockResolvedValue([] as any);
+
+    Object.defineProperty(process, 'platform', { value: 'darwin' });
+    try {
+      await bridge.initialize();
+      const result = await bridge.renderSequence('seq-1', '/tmp/out.mp4', '/tmp/preset.epr');
+
+      expect(result.success).toBe(false);
+      expect(result.code).toBe('MEDIA_ENCODER_NOT_INSTALLED');
+      expect(result.error).toContain('not sent to Premiere');
+      expect(mockFs.writeFile).not.toHaveBeenCalled();
+    } finally {
+      if (platformDescriptor) Object.defineProperty(process, 'platform', platformDescriptor);
+    }
   });
 
   it('blocks modal-prone unsupported subtitle imports before writing a command', async () => {
@@ -137,11 +197,11 @@ describe('PremiereProBridge', () => {
     expect(result.success).toBe(false);
     expect(result.projectPath).toBe('/tmp/projects/Test.prproj');
     expect(mockFs.writeFile).toHaveBeenCalledWith(
-      '/tmp/premiere-mcp-bridge-test/command-test-uuid-1234.json',
+      stagingPath,
       expect.stringContaining('app.newProject(projectPath)')
     );
     expect(mockFs.writeFile).toHaveBeenCalledWith(
-      '/tmp/premiere-mcp-bridge-test/command-test-uuid-1234.json',
+      stagingPath,
       expect.stringContaining('Premiere Pro did not create or activate the requested project')
     );
   });
@@ -165,11 +225,11 @@ describe('PremiereProBridge', () => {
     expect(result.success).toBe(false);
     expect(result.actualPath).toBe('/tmp/projects/AlreadyOpen.prproj');
     expect(mockFs.writeFile).toHaveBeenCalledWith(
-      '/tmp/premiere-mcp-bridge-test/command-test-uuid-1234.json',
+      stagingPath,
       expect.stringContaining('app.openDocument(projectPath)')
     );
     expect(mockFs.writeFile).toHaveBeenCalledWith(
-      '/tmp/premiere-mcp-bridge-test/command-test-uuid-1234.json',
+      stagingPath,
       expect.stringContaining('Premiere Pro did not activate the requested project')
     );
   });
@@ -187,14 +247,62 @@ describe('PremiereProBridge', () => {
     mockFs.unlink.mockResolvedValue(undefined);
 
     await bridge.initialize();
-    const result: any = await bridge.createSequence('Safe Sequence');
+    const result: any = await bridge.createSequence('Safe Sequence', '/tmp/sequence.sqpreset');
     const commandPayload = JSON.parse(mockFs.writeFile.mock.calls[0][1] as string);
 
     expect(result.success).toBe(true);
     expect(result.id).toBe('seq-123');
     expect(commandPayload.script).toContain('try {');
-    expect(commandPayload.script).toContain('app.project.createNewSequence(sequenceName, presetPath || "")');
+    expect(commandPayload.script).toContain('app.project.newSequence(sequenceName, presetFile.fsName)');
+    expect(commandPayload.script).toContain('Sequence preset file not found');
     expect(commandPayload.script).toContain('Sequence creation completed but the new sequence could not be located');
+  });
+
+  it('honors per-clip linkAudio in addToTimelineBatch (mirrors single-call audio-counterpart cleanup)', async () => {
+    const bridge = new PremiereProBridge();
+    mockFs.mkdir.mockResolvedValue(undefined);
+    mockFs.access.mockRejectedValue(new Error('Not found'));
+    mockFs.writeFile.mockResolvedValue(undefined);
+    mockFs.readFile.mockResolvedValue(JSON.stringify({ success: true, placed: 2, total: 2, results: [] }));
+    mockFs.unlink.mockResolvedValue(undefined);
+
+    await bridge.initialize();
+    await bridge.addToTimelineBatch('seq-1', [
+      { projectItemId: 'pi-1', trackIndex: 0, time: 0, linkAudio: false },
+      { projectItemId: 'pi-2', trackIndex: 0, time: 5 } // omitted → defaults to true
+    ]);
+    const commandPayload = JSON.parse(mockFs.writeFile.mock.calls[0][1] as string);
+
+    // per-clip linkAudio is embedded in the specs (explicit false + defaulted true)
+    expect(commandPayload.script).toContain('"linkAudio":false');
+    expect(commandPayload.script).toContain('"linkAudio":true');
+    // the counterpart-audio cleanup is mirrored from the single-call addToTimeline path
+    expect(commandPayload.script).toContain('spec.linkAudio === false');
+    expect(commandPayload.script).toContain('audioClip.remove(false, false)');
+    expect(commandPayload.script).toContain('unlinkedAudioRemoved');
+  });
+
+  it('reports aggregate success/partial/failure in addToTimelineBatch instead of always claiming success', async () => {
+    const bridge = new PremiereProBridge();
+    mockFs.mkdir.mockResolvedValue(undefined);
+    mockFs.access.mockRejectedValue(new Error('Not found'));
+    mockFs.writeFile.mockResolvedValue(undefined);
+    mockFs.readFile.mockResolvedValue(JSON.stringify({ success: false, status: 'partial', placed: 1, failed: 1, total: 2, results: [] }));
+    mockFs.unlink.mockResolvedValue(undefined);
+
+    await bridge.initialize();
+    await bridge.addToTimelineBatch('seq-1', [
+      { projectItemId: 'pi-1', trackIndex: 0, time: 0 },
+      { projectItemId: 'pi-2', trackIndex: 0, time: 5 }
+    ]);
+    const commandPayload = JSON.parse(mockFs.writeFile.mock.calls[0][1] as string);
+
+    // aggregate success is derived from the placed count, not hard-coded true
+    expect(commandPayload.script).toContain('var allPlaced = (specs.length > 0 && placed === specs.length)');
+    expect(commandPayload.script).toContain('success: allPlaced');
+    expect(commandPayload.script).toContain('status:');
+    // the old always-true aggregate must be gone
+    expect(commandPayload.script).not.toContain('success: true, placed: placed, total: specs.length');
   });
 
   it('does not delete externally managed temp directories during cleanup', async () => {
@@ -218,6 +326,9 @@ describe('PremiereProBridge', () => {
     await bridge.initialize();
     await bridge.cleanup();
 
-    expect(mockFs.rm).toHaveBeenCalledWith('/tmp/premiere-bridge-test-uuid-1234', { recursive: true });
+    const generatedTempDir = process.platform === 'win32'
+      ? path.join(process.env.TEMP || 'C:\\Temp', 'premiere-bridge-test-uuid-1234')
+      : '/tmp/premiere-bridge-test-uuid-1234';
+    expect(mockFs.rm).toHaveBeenCalledWith(generatedTempDir, { recursive: true });
   });
 });

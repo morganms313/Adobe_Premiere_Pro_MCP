@@ -2,6 +2,17 @@
 
 set -euo pipefail
 
+SKIP_BUILD=false
+if [[ "${1:-}" == "--skip-build" ]]; then
+  SKIP_BUILD=true
+  shift
+fi
+
+if [[ "$#" -gt 0 ]]; then
+  echo "Unknown option: $1"
+  exit 1
+fi
+
 if [[ "$(uname -s)" != "Darwin" ]]; then
   echo "This installer currently supports macOS only."
   exit 1
@@ -16,21 +27,25 @@ TEMP_DIR="/tmp/premiere-mcp-bridge"
 DIST_ENTRY="$REPO_ROOT/dist/index.js"
 
 if ! command -v node >/dev/null 2>&1; then
-  echo "Node.js 18+ is required but 'node' was not found."
+  echo "Node.js 20+ is required but 'node' was not found."
   exit 1
 fi
 
 NODE_MAJOR="$(node -p "process.versions.node.split('.')[0]")"
-if [[ "$NODE_MAJOR" -lt 18 ]]; then
-  echo "Node.js 18+ is required. Found: $(node -v)"
+if [[ "$NODE_MAJOR" -lt 20 ]]; then
+  echo "Node.js 20+ is required. Found: $(node -v)"
   exit 1
 fi
 
-echo "Installing npm dependencies..."
-npm install --prefix "$REPO_ROOT"
+if [[ "$SKIP_BUILD" == "true" ]]; then
+  echo "Using packaged build..."
+else
+  echo "Installing npm dependencies..."
+  npm install --prefix "$REPO_ROOT"
 
-echo "Building MCP server..."
-npm run build --prefix "$REPO_ROOT"
+  echo "Building MCP server..."
+  npm run build --prefix "$REPO_ROOT"
+fi
 
 if [[ ! -f "$DIST_ENTRY" ]]; then
   echo "Build completed but dist/index.js was not created."

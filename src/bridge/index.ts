@@ -7,11 +7,21 @@
 
 import { Logger } from '../utils/logger.js';
 import { ChildProcess } from 'child_process';
+import { randomUUID } from 'node:crypto';
 import { promises as fs } from 'fs';
 import { extname, join } from 'path';
-import { v4 as uuidv4 } from 'uuid';
 import { createSecureTempDir, validateFilePath } from '../utils/security.js';
 import type { PremiereProTransport } from './types.js';
+
+export const BRIDGE_HEARTBEAT_FILE = 'bridge-heartbeat.json';
+export const BRIDGE_PANEL_ABSENT_MS = 1500;
+export const BRIDGE_HEARTBEAT_STALE_MS = 2500;
+export const HEALTH_CHECK_TIMEOUT_MS = 8000;
+export const BRIDGE_PANEL_NOT_RUNNING =
+  'MCP Bridge is not running. Open Premiere Pro, choose Window > Extensions > MCP Bridge, then click Start Bridge. Do not retry until the panel says Connected.';
+export const BRIDGE_NOT_STARTED =
+  'MCP Bridge panel is open but Start Bridge has not been clicked. Click Start Bridge, wait until it says Connected, then retry once.';
+
 
 const UNSUPPORTED_MODAL_PRONE_IMPORT_EXTENSIONS = new Set([
   '.ass',
@@ -20,13 +30,37 @@ const UNSUPPORTED_MODAL_PRONE_IMPORT_EXTENSIONS = new Set([
 
 const EXTENDSCRIPT_HELPERS = `
 function __mcpEscapeString(value) {
-  return String(value)
-    .replace(/\\\\/g, '\\\\\\\\')
-    .replace(/"/g, '\\\\"')
-    .replace(/\\r/g, '\\\\r')
-    .replace(/\\n/g, '\\\\n')
-    .replace(/\\t/g, '\\\\t');
+  // Built from character codes rather than backslash literals on purpose: this
+  // function is written inside a TypeScript template literal, where an escape
+  // is consumed once before it ever reaches Premiere.
+  var text = String(value);
+  var backslash = String.fromCharCode(92);
+  var out = '';
+  for (var i = 0; i < text.length; i++) {
+    var code = text.charCodeAt(i);
+    if (code === 34) { out += backslash + '"'; }
+    else if (code === 92) { out += backslash + backslash; }
+    else if (code === 8) { out += backslash + 'b'; }
+    else if (code === 9) { out += backslash + 't'; }
+    else if (code === 10) { out += backslash + 'n'; }
+    else if (code === 12) { out += backslash + 'f'; }
+    else if (code === 13) { out += backslash + 'r'; }
+    else if (code < 32 || code === 0x2028 || code === 0x2029) {
+      // Everything else below U+0020 has no short form and must go out as a
+      // \\uXXXX escape. U+2028 and U+2029 are legal inside a JSON string but
+      // are line terminators to a JavaScript parser, so they are escaped too
+      // for any consumer that evaluates rather than parses the payload.
+      var hex = code.toString(16);
+      while (hex.length < 4) { hex = '0' + hex; }
+      out += backslash + 'u' + hex;
+    }
+    else { out += text.charAt(i); }
+  }
+  return out;
 }
+// Saved before anything can shadow it. Reading hasOwnProperty off the value being
+// serialised lets that value decide which of its own keys are emitted.
+var __mcpOwnProperty = Object.prototype.hasOwnProperty;
 function __mcpStringify(value) {
   if (value === null) return 'null';
   var valueType = typeof value;
@@ -43,16 +77,231 @@ function __mcpStringify(value) {
   if (valueType === 'object') {
     var objectParts = [];
     for (var key in value) {
-      if (value.hasOwnProperty && !value.hasOwnProperty(key)) continue;
-      if (typeof value[key] === 'undefined' || typeof value[key] === 'function') continue;
-      objectParts.push(__mcpStringify(String(key)) + ':' + __mcpStringify(value[key]));
+      // Through the saved reference, because an own property named hasOwnProperty
+      // shadows the method. A non-function threw and lost the whole response; a
+      // function returning false was worse, emitting {} that parses cleanly while
+      // every field silently vanished.
+      //
+      // Switching to the reference would drop data if a host object carried its
+      // values on a prototype, so that was measured rather than assumed: across
+      // Application, Project, ProjectItem, Sequence, SequenceSettings, Track,
+      // TrackCollection, TrackItem and MarkerCollection on 26.0.2 -- 101 enumerable
+      // keys -- every one is an own property and none inherited. Keys are kept if
+      // the check itself throws: one extra inherited key is recoverable, dropping
+      // data is not.
+      var isOwn = true;
+      try { isOwn = __mcpOwnProperty.call(value, key); } catch (ownError) { isOwn = true; }
+      if (!isOwn) continue;
+      // Read once, and survive a read that throws. Guarding the ownership check
+      // while leaving the read unguarded still lost the whole response to a
+      // property that raises on access -- and a DOM object reaches here directly
+      // through evaluate_expression. Reading twice also ran any side effect twice.
+      var member;
+      try { member = value[key]; } catch (readError) { continue; }
+      if (typeof member === 'undefined' || typeof member === 'function') continue;
+      objectParts.push(__mcpStringify(String(key)) + ':' + __mcpStringify(member));
     }
     return '{' + objectParts.join(',') + '}';
   }
   return 'null';
 }
 if (typeof JSON === 'undefined') { JSON = {}; }
-if (typeof JSON.stringify !== 'function') { JSON.stringify = __mcpStringify; }
+// This engine has no JSON of its own. Measured on ExtendScript build 80.1060872:
+// neither JSON.parse nor JSON.stringify exists, so the object created on the line
+// above is fabricated by this prelude, and both directions installed below are the
+// only ones the engine will ever have. The parser is further down, after the
+// escaper it mirrors.
+//
+// Mind the wording here: the panel validates the whole script, prelude included,
+// against a list of patterns that includes a bare "process" followed by a dot.
+// A comment matching one of those makes the panel reject every call.
+//
+// It replaces one that escaped only backslash, quote, carriage return, line
+// feed and tab, passing every other control character through raw. Every tool
+// returns its payload through this function, so a single U+0001 in a clip or
+// marker name did not corrupt one field -- it made the entire response
+// unparseable and the whole call was lost.
+//
+// Assigned unconditionally rather than behind a typeof guard. On this engine
+// the guard can never be false; should a later host ship its own, a measured
+// escaper is still preferable to an unmeasured one. That makes the limits below
+// the limits, so they are listed in full. This covers what the tools return --
+// strings, finite numbers, booleans, null, arrays and plain objects -- and
+// differs from a conformant JSON.stringify:
+//
+//   Date              {} rather than an ISO string, and toJSON() is ignored.
+//   circular refs     recurses until the stack gives out; no clean TypeError.
+//   boxed primitives  new String/Number/Boolean serialise as objects.
+//   undefined, fn     at the top level return "null" rather than undefined.
+//   replacer, space   accepted positionally by callers and ignored; output is
+//                     never indented.
+//
+// Add any of those to a tool response and this needs extending first.
+JSON.stringify = __mcpStringify;
+// Recursive descent, because the engine has no JSON.parse either and the object
+// above is fabricated: installing only stringify leaves a JSON that answers
+// typeof but has no read direction, so a caller that feature-detects it gets a
+// missing-function error instead. add_text_overlay decodes a MOGRT text payload
+// that way and could never succeed.
+//
+// Recursive descent rather than the usual one-liner built on the dynamic code
+// evaluator: the panel rejects any script mentioning that function by name and
+// would refuse every call. This comment cannot spell it either, which the
+// generated-script test enforces. Characters are compared by code rather than by
+// literal for the same reason __mcpEscapeString does it -- a backslash written
+// here is consumed by the template literal before it reaches the host.
+// Two limits, measured rather than assumed. Nesting is bounded by the JavaScript
+// call stack: around 6,000 levels before it gives out, against no observed limit
+// in a modern engine. And each string is built one character at a time, which is
+// linear where the engine has rope strings and quadratic where it does not; both
+// are far outside the shape of a tool payload, but a caller feeding this arbitrary
+// third-party JSON should know. The host cost of either is unmeasured.
+function __mcpParse(text) {
+  var source = String(text);
+  var at = 0;
+
+  function fail(what) {
+    throw new Error('JSON.parse: ' + what + ' at position ' + at);
+  }
+  function skipWhitespace() {
+    while (at < source.length) {
+      var code = source.charCodeAt(at);
+      if (code === 32 || code === 9 || code === 10 || code === 13) { at++; } else { break; }
+    }
+  }
+  function expect(code) {
+    if (source.charCodeAt(at) !== code) fail('expected character ' + code);
+    at++;
+  }
+  function parseString() {
+    expect(34);
+    var out = '';
+    while (at < source.length) {
+      var code = source.charCodeAt(at);
+      if (code === 34) { at++; return out; }
+      if (code === 92) {
+        at++;
+        var esc = source.charCodeAt(at);
+        at++;
+        if (esc === 34) { out += String.fromCharCode(34); }
+        else if (esc === 92) { out += String.fromCharCode(92); }
+        else if (esc === 47) { out += '/'; }
+        else if (esc === 98) { out += String.fromCharCode(8); }
+        else if (esc === 102) { out += String.fromCharCode(12); }
+        else if (esc === 110) { out += String.fromCharCode(10); }
+        else if (esc === 114) { out += String.fromCharCode(13); }
+        else if (esc === 116) { out += String.fromCharCode(9); }
+        else if (esc === 117) {
+          var hex = source.substr(at, 4);
+          if (hex.length !== 4 || !/^[0-9a-fA-F]{4}$/.test(hex)) fail('bad unicode escape');
+          out += String.fromCharCode(parseInt(hex, 16));
+          at += 4;
+        }
+        else fail('bad escape');
+        continue;
+      }
+      // Unescaped control characters are not legal inside a JSON string.
+      if (code < 32) fail('unescaped control character');
+      out += source.charAt(at);
+      at++;
+    }
+    fail('unterminated string');
+  }
+  // The escape below is doubled deliberately. A single backslash is consumed by
+  // the template literal, and the host then receives a dot that matches any
+  // character -- which accepted 012, 000 and 0123 as numbers on a live 26.0.2.
+  function parseNumber() {
+    var start = at;
+    if (source.charCodeAt(at) === 45) at++;
+    while (at < source.length && source.charCodeAt(at) >= 48 && source.charCodeAt(at) <= 57) at++;
+    if (source.charCodeAt(at) === 46) {
+      at++;
+      while (at < source.length && source.charCodeAt(at) >= 48 && source.charCodeAt(at) <= 57) at++;
+    }
+    var exponent = source.charCodeAt(at);
+    if (exponent === 101 || exponent === 69) {
+      at++;
+      var sign = source.charCodeAt(at);
+      if (sign === 43 || sign === 45) at++;
+      while (at < source.length && source.charCodeAt(at) >= 48 && source.charCodeAt(at) <= 57) at++;
+    }
+    var literal = source.substring(start, at);
+    if (!/^-?(0|[1-9][0-9]*)(\\.[0-9]+)?([eE][-+]?[0-9]+)?$/.test(literal)) fail('bad number');
+    return Number(literal);
+  }
+  function parseWord() {
+    if (source.substr(at, 4) === 'true') { at += 4; return true; }
+    if (source.substr(at, 5) === 'false') { at += 5; return false; }
+    if (source.substr(at, 4) === 'null') { at += 4; return null; }
+    fail('unexpected token');
+  }
+  function parseValue() {
+    skipWhitespace();
+    var code = source.charCodeAt(at);
+    if (code === 34) return parseString();
+    if (code === 123) {
+      at++;
+      var object = {};
+      skipWhitespace();
+      if (source.charCodeAt(at) === 125) { at++; return object; }
+      for (;;) {
+        skipWhitespace();
+        var key = parseString();
+        skipWhitespace();
+        expect(58);
+        var member = parseValue();
+        if (key === '__proto__') {
+          // Measured on 26.0.2: this engine implements the __proto__ setter, so
+          // plain assignment grafts the payload onto the prototype instead of
+          // adding a key -- a value carrying {"__proto__":{"mTextString":"X"}}
+          // then reads back X from a field nobody set, and {"__proto__":null}
+          // yields an object whose String() throws.
+          //
+          // Object.defineProperty does not exist here either, so the key cannot be
+          // created as an ordinary property. It is dropped instead. That differs
+          // from a conformant parser, which defines an own property, and the
+          // difference is deliberate: losing one key is recoverable, silent field
+          // injection is not. Where defineProperty does exist the conformant
+          // behaviour is used.
+          if (typeof Object.defineProperty === 'function') {
+            try {
+              Object.defineProperty(object, key, {
+                value: member, enumerable: true, writable: true, configurable: true
+              });
+            } catch (defineError) { /* left out rather than assigned */ }
+          }
+        } else {
+          object[key] = member;
+        }
+        skipWhitespace();
+        if (source.charCodeAt(at) === 44) { at++; continue; }
+        expect(125);
+        return object;
+      }
+    }
+    if (code === 91) {
+      at++;
+      var array = [];
+      skipWhitespace();
+      if (source.charCodeAt(at) === 93) { at++; return array; }
+      for (;;) {
+        array.push(parseValue());
+        skipWhitespace();
+        if (source.charCodeAt(at) === 44) { at++; continue; }
+        expect(93);
+        return array;
+      }
+    }
+    if (code === 45 || (code >= 48 && code <= 57)) return parseNumber();
+    return parseWord();
+  }
+
+  var result = parseValue();
+  skipWhitespace();
+  if (at < source.length) fail('unexpected trailing content');
+  return result;
+}
+JSON.parse = __mcpParse;
 function __findSequence(id) {
   if (!app.project || !app.project.sequences) return null;
   for (var i = 0; i < app.project.sequences.numSequences; i++) {
@@ -60,19 +309,118 @@ function __findSequence(id) {
   }
   return null;
 }
+function __qeSequenceFor(seq) {
+  if (!seq) return null;
+  try { app.enableQE(); } catch (eEnable) { return null; }
+  var count = 0;
+  try { count = qe.project.numSequences; } catch (eCount) { return null; }
+  for (var qi = 0; qi < count; qi++) {
+    // Each index is guarded separately: qe.project.numSequences can report more
+    // sequences than getSequenceAt() will actually return, and a throw at one
+    // index must not abort the scan before the target index is reached.
+    try {
+      var candidate = qe.project.getSequenceAt(qi);
+      if (candidate && String(candidate.guid) === String(seq.sequenceID)) return candidate;
+    } catch (eAt) {}
+  }
+  // getSequenceAt() does not expose every sequence: one created by
+  // duplicate_sequence and never opened in a timeline is invisible to it, even
+  // while it is the active sequence. getActiveSequence() still returns a
+  // working handle in that case — verified against 26.0.2, guid and all — so
+  // fall back to it, but only once the guid confirms it is the sequence that
+  // was asked for. Addressing the wrong one is the bug this helper exists to
+  // prevent.
+  try {
+    var activeCandidate = qe.project.getActiveSequence();
+    if (activeCandidate && String(activeCandidate.guid) === String(seq.sequenceID)) return activeCandidate;
+  } catch (eActive) {}
+  return null;
+}
+function __findQeClipByDomClip(qeTrack, domClip) {
+  // QE track items are not the DOM clip list: they include gaps and
+  // transitions, so the DOM clip index addresses a different item as soon as
+  // anything precedes the target. Verified against 26.0.2 — a track holding
+  // three clips with one gap reported five QE items, and color_correct on DOM
+  // clip 2 landed on the gap at QE index 2 and reported success having done
+  // nothing. Match on start time instead, and skip anything that is not a clip.
+  if (!qeTrack || !domClip) return null;
+  var targetTicks = null;
+  try { targetTicks = String(domClip.start.ticks); } catch (eTarget) {}
+  var best = null, bestDelta = null;
+  for (var qi = 0; qi < qeTrack.numItems; qi++) {
+    var item = qeTrack.getItemAt(qi);
+    if (!item) continue;
+    var itemType = null;
+    try { itemType = String(item.type); } catch (eType) {}
+    if (itemType !== "Clip") continue;
+    if (targetTicks === null) return item;
+    var itemTicks = null;
+    try { itemTicks = String(item.start.ticks); } catch (eItem) {}
+    if (itemTicks === targetTicks) return item;
+    if (itemTicks !== null) {
+      var delta = Math.abs(parseInt(itemTicks, 10) - parseInt(targetTicks, 10));
+      if (best === null || delta < bestDelta) { best = item; bestDelta = delta; }
+    }
+  }
+  return best;
+}
+function __idsMatch(a, b) {
+  if (a == null || b == null) return false;
+  var sa = String(a);
+  var sb = String(b);
+  if (sa === sb) return true;
+  if (sa.toLowerCase() === sb.toLowerCase()) return true;
+  function numericId(s) {
+    if (/^[0-9]+$/.test(s)) return parseInt(s, 10);
+    if (/^[0-9a-fA-F]+$/.test(s) && (/[a-fA-F]/.test(s) || s.charAt(0) === "0")) return parseInt(s, 16);
+    return NaN;
+  }
+  var na = numericId(sa);
+  var nb = numericId(sb);
+  return !isNaN(na) && !isNaN(nb) && na === nb;
+}
+function __normalizeSpeedRatio(speed) {
+  var n = Number(speed);
+  if (!isFinite(n) || n <= 0) return null;
+  if (n > 10) n = n / 100;
+  return n;
+}
+function __setClipSpeed(qeClip, domClip, ratio, reverse, maintainPitch, ripple) {
+  // QE setSpeed is five arguments: (multiplier, durationTicksString, reverse, pitch, ripple).
+  // Two-arg (percent, boolean) throws "Not Enough Parameters" or "Illegal Parameter type".
+  // Read ticks from the regular DOM — qeClip.duration is a timecode string, Number() of it is NaN.
+  if (!qeClip || typeof qeClip.setSpeed !== "function") {
+    throw new Error("QE clip setSpeed API unavailable");
+  }
+  var origTicks = 0;
+  try { origTicks = Number(domClip.duration.ticks); } catch (eTicks) {}
+  var targetTicks = (origTicks > 0 && ratio > 0) ? String(Math.round(origTicks / ratio)) : "";
+  var rev = Boolean(reverse);
+  var pitch = Boolean(maintainPitch);
+  var rip = Boolean(ripple);
+  try {
+    return qeClip.setSpeed(ratio, targetTicks, rev, pitch, rip);
+  } catch (ePrimary) {
+    try {
+      return qeClip.setSpeed(ratio, "", rev, pitch, rip);
+    } catch (eEmpty) {
+      throw ePrimary;
+    }
+  }
+}
 function __findClipInSequence(seq, nodeId) {
   if (!seq) return null;
   for (var t = 0; t < seq.videoTracks.numTracks; t++) {
     var track = seq.videoTracks[t];
     for (var c = 0; c < track.clips.numItems; c++) {
-      if (track.clips[c].nodeId === nodeId)
+      if (__idsMatch(track.clips[c].nodeId, nodeId))
         return { clip: track.clips[c], track: track, trackIndex: t, clipIndex: c, trackType: 'video', sequence: seq, sequenceId: seq.sequenceID, sequenceName: seq.name };
     }
   }
   for (var t = 0; t < seq.audioTracks.numTracks; t++) {
     var track = seq.audioTracks[t];
     for (var c = 0; c < track.clips.numItems; c++) {
-      if (track.clips[c].nodeId === nodeId)
+      if (__idsMatch(track.clips[c].nodeId, nodeId))
         return { clip: track.clips[c], track: track, trackIndex: t, clipIndex: c, trackType: 'audio', sequence: seq, sequenceId: seq.sequenceID, sequenceName: seq.name };
     }
   }
@@ -101,7 +449,7 @@ function __samePath(a, b) {
 function __findProjectItem(nodeId) {
   if (!app.project || !app.project.rootItem) return null;
   function walk(item) {
-    if (item.nodeId === nodeId) return item;
+    if (__idsMatch(item.nodeId, nodeId)) return item;
     if (item.children) {
       for (var i = 0; i < item.children.numItems; i++) {
         var found = walk(item.children[i]);
@@ -182,7 +530,7 @@ export class PremiereProBridge implements PremiereProTransport {
   constructor() {
     this.logger = new Logger('PremiereProBridge');
     this.communicationMethod = 'file'; // Default to file-based communication
-    this.sessionId = uuidv4();
+    this.sessionId = randomUUID();
     // Use PREMIERE_TEMP_DIR if set (same path as UXP plugin "Temp Directory"), else session-specific
     const envDir = process.env.PREMIERE_TEMP_DIR;
     this.usesExternalTempDir = Boolean(envDir);
@@ -213,21 +561,36 @@ export class PremiereProBridge implements PremiereProTransport {
   }
 
   private async detectPremiereProInstallation(): Promise<void> {
-    // Check for common Premiere Pro installation paths
-    const commonPaths = [
-      '/Applications/Adobe Premiere Pro 2024/Adobe Premiere Pro 2024.app',
-      '/Applications/Adobe Premiere Pro 2023/Adobe Premiere Pro 2023.app',
-      'C:\\Program Files\\Adobe\\Adobe Premiere Pro 2024\\Adobe Premiere Pro.exe',
-      'C:\\Program Files\\Adobe\\Adobe Premiere Pro 2023\\Adobe Premiere Pro.exe'
-    ];
+    // Scan the install root instead of hardcoding release years, so new
+    // versions (2025, 2026, ...) are detected without a code change.
+    const searchDirs = process.platform === 'win32'
+      ? [join(process.env['ProgramFiles'] || 'C:\\Program Files', 'Adobe')]
+      : ['/Applications'];
 
-    for (const path of commonPaths) {
+    for (const dir of searchDirs) {
+      let entries: string[] = [];
       try {
-        await fs.access(path);
-        this.logger.info(`Found Adobe Premiere Pro at: ${path}`);
-        return;
+        const listing = await fs.readdir(dir);
+        entries = Array.isArray(listing) ? listing : [];
       } catch (error) {
-        // Continue checking other paths
+        continue; // Install root is missing on this machine
+      }
+
+      // Newest release first, e.g. "Adobe Premiere Pro 2026" before "... 2024"
+      const candidates = entries
+        .filter(entry => entry.startsWith('Adobe Premiere Pro'))
+        .sort()
+        .reverse();
+
+      for (const candidate of candidates) {
+        const path = join(dir, candidate);
+        try {
+          await fs.access(path);
+          this.logger.info(`Found Adobe Premiere Pro at: ${path}`);
+          return;
+        } catch (error) {
+          // Continue checking other candidates
+        }
       }
     }
 
@@ -246,65 +609,193 @@ export class PremiereProBridge implements PremiereProTransport {
     return /^\(function\s*\(\)\s*\{[\s\S]*\}\)\s*\(\)\s*;?$/.test(trimmed);
   }
 
-  private buildExecutableScript(script: string): string {
-    if (this.isSelfInvokingScript(script)) {
-      return EXTENDSCRIPT_HELPERS + script.trim();
+  /**
+   * Repairs the two characters that survive JSON.stringify but not the trip
+   * into Premiere. Both were reproduced against a live 26.0.2 host.
+   *
+   * U+2028 and U+2029 are legal unescaped inside a JSON string, so
+   * JSON.stringify leaves them raw — but they are line terminators to a
+   * JavaScript parser, so a marker named with one produced a generated script
+   * with a string literal split across two lines, and the whole call died as
+   * "ExtendScript execution failed via CEP evalScript()". Re-escaping them is
+   * safe here because everything this server generates is otherwise ASCII, so
+   * the only place either can appear is inside a string literal.
+   */
+  private static repairScriptLineTerminators(script: string): string {
+    return script
+      .replace(/\u2028/g, '\\u2028')
+      .replace(/\u2029/g, '\\u2029');
+  }
+
+  /**
+   * A NUL truncates the script at that byte on the way through evalScript, so
+   * the host silently receives a prefix of what was sent — a marker named
+   * "p\0q" was created as "p". Truncated input is worse than a rejected call,
+   * so refuse it and say which argument carried it.
+   */
+  private static assertNoNulByte(script: string): void {
+    const index = script.indexOf('\u0000');
+    if (index === -1) return;
+
+    const context = script.slice(Math.max(0, index - 40), index).replace(/\s+/g, ' ');
+    throw new Error(
+      'Script contains a NUL byte, which Premiere truncates at rather than ' +
+      'rejecting, silently discarding everything after it. Remove the NUL ' +
+      `from the offending argument. Context before it: ...${context}`,
+    );
+  }
+
+  private buildExecutableScript(script: string, callerAuthored = false): string {
+    PremiereProBridge.assertNoNulByte(script);
+
+    // The line-terminator repair is only safe on scripts this server generated, where
+    // everything outside a string literal is ASCII and a U+2028 can therefore only be
+    // caller data inside a string. A script handed to execute_extendscript breaks that
+    // assumption: rewriting it blindly turned a U+2028 the caller used as a line break
+    // into the literal characters \u2028, producing a syntax error on a script that
+    // previously ran. Caller-authored source is passed through untouched.
+    const safeScript = callerAuthored
+      ? script
+      : PremiereProBridge.repairScriptLineTerminators(script);
+
+    if (this.isSelfInvokingScript(safeScript)) {
+      return EXTENDSCRIPT_HELPERS + safeScript.trim();
     }
 
     // Wrap script bodies so top-level "return ..." remains valid in ExtendScript.
-    return EXTENDSCRIPT_HELPERS + '(function(){\n' + script + '\n})();';
+    return EXTENDSCRIPT_HELPERS + '(function(){\n' + safeScript + '\n})();';
   }
 
-  async executeScript(script: string): Promise<any> {
+  async executeScript(script: string, timeoutMs?: number, callerAuthored = false): Promise<any> {
     if (!this.isInitialized) {
       throw new Error('Bridge not initialized. Call initialize() first.');
     }
 
-    const commandId = uuidv4();
+    const commandId = randomUUID();
     const commandFile = join(this.tempDir, `command-${commandId}.json`);
     const responseFile = join(this.tempDir, `response-${commandId}.json`);
+    // Declared out here so the finally below can remove it: if rename() fails the
+    // scratch file is still on disk, and nothing else ever matches that name.
+    const commandStaging = join(this.tempDir, `.tmp-${commandId}.json`);
 
     try {
-      const fullScript = this.buildExecutableScript(script);
+      const fullScript = this.buildExecutableScript(script, callerAuthored);
 
-      // Write command to file
-      await fs.writeFile(commandFile, JSON.stringify({
+      // Write command to file. Include timeoutMs so the CEP/UXP panel can extend its own
+      // execution watchdog to match — otherwise the panel's default (45s) kills long batch
+      // scripts well before the server's own timeout elapses.
+      //
+      // Written to a scratch name and renamed into place, because the panel polls this
+      // directory and picks up anything matching command-*.json the moment it appears. A
+      // plain write publishes the filename before the content is complete, so the panel
+      // can read a truncated command, fail to parse it, and — since its parse failure path
+      // writes an error response and deletes the command — turn a transient race into a
+      // permanent spurious failure with no retry. rename() within one directory is atomic,
+      // so the file becomes visible only once it is whole.
+      //
+      // The scratch name must not itself look like a command to the panel, which matches on
+      // a "command-" prefix; a leading dot keeps it out of that test.
+      await fs.writeFile(commandStaging, JSON.stringify({
         id: commandId,
         script: fullScript,
+        timeoutMs: timeoutMs,
         timestamp: new Date().toISOString()
       }));
+      await fs.rename(commandStaging, commandFile);
 
-      // Wait for response (in a real implementation, this would be handled by the UXP plugin)
-      const response = await this.waitForResponse(responseFile);
-      
-      // Clean up files
-      await fs.unlink(commandFile).catch(() => {});
-      await fs.unlink(responseFile).catch(() => {});
-
-      return response;
+      // Wait for response (in a real implementation, this would be handled by the UXP plugin).
+      // Batch operations pass a larger timeout because a single round-trip does the work of
+      // dozens of individual calls inside one ExtendScript pass.
+      return await this.waitForResponse(responseFile, timeoutMs);
     } catch (error) {
       this.logger.error(`Failed to execute script: ${error}`);
       throw error;
+    } finally {
+      // Cleanup has to run on the failure path too. Previously it sat after the await, so a
+      // timeout skipped it entirely and left the command file behind for the panel to pick
+      // up and execute long after the caller had given up on it.
+      //
+      // One case this does not close: when the panel is merely slow, the response file is
+      // written after this has already run, so it stays until the directory is cleaned. The
+      // command file is the one that matters here, because a stale command still executes.
+      await fs.unlink(commandStaging).catch(() => {});
+      await fs.unlink(commandFile).catch(() => {});
+      await fs.unlink(responseFile).catch(() => {});
+    }
+  }
+
+  private async readHeartbeat(): Promise<{ t: number; started: boolean } | null> {
+    try {
+      const raw = await fs.readFile(join(this.tempDir, BRIDGE_HEARTBEAT_FILE), 'utf8');
+      const parsed = JSON.parse(raw) as { t?: unknown; started?: unknown };
+      if (typeof parsed?.t !== 'number' || !Number.isFinite(parsed.t)) return null;
+      if (Date.now() - parsed.t > BRIDGE_HEARTBEAT_STALE_MS) return null;
+      return { t: parsed.t, started: parsed.started === true };
+    } catch {
+      return null;
     }
   }
 
   private async waitForResponse(responseFile: string, timeout = 60000): Promise<any> {
     const startTime = Date.now();
+    // A response that exists but will not parse is a different failure from one that has
+    // not arrived, and reporting it as the latter sends the reader to check whether
+    // Premiere is running when the real problem is the payload. Allow a few attempts for a
+    // torn read — the panel's write is not atomic on every host — then surface the parse
+    // error and a sample of what was actually on disk.
+    let lastParseError: Error | null = null;
+    let lastRawResponse = '';
+    let parseAttempts = 0;
 
     while (Date.now() - startTime < timeout) {
+      let raw: string | undefined;
       try {
-        const response = await fs.readFile(responseFile, 'utf8');
-        const parsed = JSON.parse(response);
-        if (parsed.result !== undefined) return parsed.result;
-        return parsed;
-      } catch (error) {
-        await new Promise(resolve => setTimeout(resolve, 150));
+        raw = await fs.readFile(responseFile, 'utf8');
+      } catch {
+        raw = undefined;
       }
+
+      if (raw !== undefined) {
+        try {
+          const parsed = JSON.parse(raw);
+          if (parsed.result !== undefined) return parsed.result;
+          return parsed;
+        } catch (error) {
+          lastParseError = error instanceof Error ? error : new Error(String(error));
+          lastRawResponse = raw;
+          parseAttempts++;
+        }
+      }
+
+      // The panel writes bridge-heartbeat.json on every poll. If that file is
+      // missing or stale after a couple of seconds, Premiere is not listening —
+      // waiting the remaining minute just makes the caller sit on a dead socket.
+      // A fresh heartbeat with started:true means the panel has the command and
+      // we should wait out the real timeout (evalScript can be slow).
+      if (Date.now() - startTime >= BRIDGE_PANEL_ABSENT_MS) {
+        const beat = await this.readHeartbeat();
+        if (!beat) {
+          throw new Error(BRIDGE_PANEL_NOT_RUNNING);
+        }
+        if (!beat.started) {
+          throw new Error(BRIDGE_NOT_STARTED);
+        }
+      }
+
+      await new Promise(resolve => setTimeout(resolve, 150));
+    }
+
+    if (lastParseError) {
+      throw new Error(
+        `Bridge response never became valid JSON before the ${timeout}ms timeout. Last parse ` +
+        `error: ${lastParseError.message}. First 200 characters on disk: ` +
+        JSON.stringify(lastRawResponse.slice(0, 200))
+      );
     }
 
     throw new Error(
       'Bridge response timeout. Ensure Premiere Pro is open, MCP Bridge (CEP or UXP) panel is open, ' +
-      'Temp Directory is set to ' + this.tempDir + ', and Start Bridge is clicked.'
+      'Temp Directory is set to ' + this.tempDir + ', and Start Bridge is clicked. Do not retry until the panel says Connected.'
     );
   }
 
@@ -454,6 +945,25 @@ export class PremiereProBridge implements PremiereProTransport {
         var existingItems = [];
         __walkItems(app.project.rootItem, existingItems);
 
+        // Premiere returns true when asked to import media already in the
+        // project, but it does not add another project item. Reuse that item
+        // instead of reporting a fabricated import failure.
+        for (var existingIndex = 0; existingIndex < existingItems.length; existingIndex++) {
+          var existingItem = existingItems[existingIndex];
+          try {
+            if (existingItem.getMediaPath && existingItem.getMediaPath() === file.fsName) {
+              return JSON.stringify({
+                success: true,
+                id: existingItem.nodeId,
+                name: existingItem.name,
+                type: existingItem.type.toString(),
+                mediaPath: file.fsName,
+                alreadyImported: true
+              });
+            }
+          } catch (e) {}
+        }
+
         var importResult = app.project.importFiles([file.fsName], true, app.project.rootItem, false);
         if (!importResult) {
           return JSON.stringify({
@@ -514,11 +1024,20 @@ export class PremiereProBridge implements PremiereProTransport {
     return await this.executeScript(script);
   }
 
-  async createSequence(name: string, presetPath?: string): Promise<PremiereProSequence> {
+  async createSequence(name: string, presetPath: string): Promise<PremiereProSequence> {
     const script = `
       try {
         var sequenceName = ${JSON.stringify(name)};
-        var presetPath = ${presetPath ? JSON.stringify(presetPath) : 'null'};
+        var presetPath = ${JSON.stringify(presetPath)};
+        var presetFile = new File(presetPath);
+        if (!presetFile.exists) {
+          return JSON.stringify({
+            success: false,
+            error: "Sequence preset file not found: " + presetPath,
+            sequenceName: sequenceName,
+            blockedBeforePremiere: true
+          });
+        }
         var beforeIds = {};
 
         if (app.project && app.project.sequences) {
@@ -530,7 +1049,10 @@ export class PremiereProBridge implements PremiereProTransport {
         var sequence = null;
         var createError = null;
         try {
-          sequence = app.project.createNewSequence(sequenceName, presetPath || "");
+          // newSequence(name, presetPath) is Premiere's non-interactive preset API.
+          // createNewSequence() treats its second argument differently and can open
+          // the native New Sequence dialog on current Premiere releases.
+          sequence = app.project.newSequence(sequenceName, presetFile.fsName);
         } catch (createException) {
           createError = createException;
         }
@@ -589,15 +1111,21 @@ export class PremiereProBridge implements PremiereProTransport {
     return await this.executeScript(script);
   }
 
-  async addToTimeline(sequenceId: string, projectItemId: string, trackIndex: number, time: number, linkAudio: boolean = true): Promise<PremiereProClip> {
+  async addToTimeline(sequenceId: string, projectItemId: string, trackIndex: number, time: number, linkAudio: boolean = true, sourceInPoint?: number, sourceOutPoint?: number, insertMode: string = 'overwrite'): Promise<PremiereProClip> {
+    const useInsert = insertMode === 'insert';
     const script = `
       try {
-        var sequence = __findSequence("${sequenceId}");
+        // Both ids are caller-supplied and are embedded in generated ExtendScript.
+        // Naive quoting here was a full code-execution hole, not just a bad error
+        // message: an id of zz"); return JSON.stringify({PWNED:"..."}); (" closed
+        // the call, ran arbitrary script, and returned a forged tool result while
+        // the real work never happened.
+        var sequence = __findSequence(${JSON.stringify(sequenceId)});
         if (!sequence) {
-          return JSON.stringify({ success: false, error: "Sequence not found" });
+          return JSON.stringify({ success: false, error: "Sequence not found by id: " + ${JSON.stringify(sequenceId)} });
         }
 
-        var projectItem = __findProjectItem("${projectItemId}");
+        var projectItem = __findProjectItem(${JSON.stringify(projectItemId)});
         if (!projectItem) {
           return JSON.stringify({ success: false, error: "Project item not found" });
         }
@@ -623,7 +1151,59 @@ export class PremiereProBridge implements PremiereProTransport {
           }
         }
 
-        track.overwriteClip(projectItem, ${time});
+        // Source in/out: replicate the Source-monitor "mark in / mark out then
+        // overwrite" move. overwriteClip(projectItem, time) places whatever range
+        // is currently marked on the projectItem, so set the marks first. Without
+        // this, an arbitrary interior sub-range of a source cannot be placed.
+        var srcIn = ${sourceInPoint === undefined ? 'null' : sourceInPoint};
+        var srcOut = ${sourceOutPoint === undefined ? 'null' : sourceOutPoint};
+        var appliedSourceInOut = false;
+        var sourceInOutError = "";
+        if (srcIn !== null && srcOut !== null) {
+          try {
+            // mediaType 4 = all streams (video + audio) in one call
+            projectItem.setInPoint(srcIn, 4);
+            projectItem.setOutPoint(srcOut, 4);
+            appliedSourceInOut = true;
+          } catch (eio) {
+            try {
+              // fall back to per-stream marks (video=1, audio=2)
+              projectItem.setInPoint(srcIn, 1);
+              projectItem.setOutPoint(srcOut, 1);
+              projectItem.setInPoint(srcIn, 2);
+              projectItem.setOutPoint(srcOut, 2);
+              appliedSourceInOut = true;
+            } catch (eio2) {
+              try {
+                // last resort: no mediaType arg
+                projectItem.setInPoint(srcIn);
+                projectItem.setOutPoint(srcOut);
+                appliedSourceInOut = true;
+              } catch (eio3) {
+                sourceInOutError = String(eio3);
+              }
+            }
+          }
+        }
+
+        // insertMode was accepted by the tool, echoed back in its response, and then
+        // dropped: placement was always an overwrite. A caller asking to insert-and-shift
+        // therefore had existing footage destroyed and was told the opposite. Both methods
+        // exist on video and audio tracks in 26.0.2, so honour the request — and refuse
+        // rather than silently overwriting if this build lacks insertClip, since falling
+        // back would be the destructive direction.
+        var requestedInsert = ${useInsert ? 'true' : 'false'};
+        if (requestedInsert) {
+          if (typeof track.insertClip !== "function") {
+            return JSON.stringify({
+              success: false,
+              error: "insertMode 'insert' was requested but this Premiere build exposes no track.insertClip. Refusing rather than overwriting, which would delete existing footage."
+            });
+          }
+          track.insertClip(projectItem, ${time});
+        } else {
+          track.overwriteClip(projectItem, ${time});
+        }
 
         var placedClip = null;
         for (var i = 0; i < track.clips.numItems; i++) {
@@ -634,12 +1214,19 @@ export class PremiereProBridge implements PremiereProTransport {
           }
         }
 
-        if (!placedClip && track.clips.numItems > 0) {
-          placedClip = track.clips[track.clips.numItems - 1];
-        }
-
+        // No fallback to track.clips[numItems - 1]. That guessed at the last clip on the
+        // track — which is simply whatever was already there when the placement did not
+        // happen — and then reported its name, times and id back as though they were the
+        // new clip. Worse, its start time drove the linkAudio=false sweep below, so a
+        // placement that did nothing could delete a completely unrelated audio clip.
+        // If the clip cannot be identified, nothing downstream may act on a guess.
         if (!placedClip) {
-          return JSON.stringify({ success: false, error: "Clip placement did not produce a track item" });
+          return JSON.stringify({
+            success: false,
+            error: "Placement could not be confirmed: no clip from this project item appears at " + ${time} + "s on the target track. Nothing was reported back and no linked audio was removed.",
+            trackKind: trackKind,
+            requestedTime: ${time}
+          });
         }
 
         // linkAudio=false post-processing: when placing a video-track clip whose source
@@ -681,8 +1268,11 @@ export class PremiereProBridge implements PremiereProTransport {
           outPoint: placedClip.end.seconds,
           duration: placedClip.duration.seconds,
           mediaPath: placedClip.projectItem && placedClip.projectItem.getMediaPath ? placedClip.projectItem.getMediaPath() : "",
+          insertMode: ${JSON.stringify(useInsert ? 'insert' : 'overwrite')},
           linkAudio: ${linkAudio},
-          unlinkedAudioRemoved: unlinkedAudioRemoved
+          unlinkedAudioRemoved: unlinkedAudioRemoved,
+          appliedSourceInOut: appliedSourceInOut,
+          sourceInOutError: sourceInOutError
         });
       } catch (e) {
         return JSON.stringify({
@@ -695,56 +1285,334 @@ export class PremiereProBridge implements PremiereProTransport {
     return await this.executeScript(script);
   }
 
-  async renderSequence(sequenceId: string, outputPath: string, presetPath: string): Promise<any> {
-    // Escape backslashes and quotes in paths so JSX string-eval is safe
-    const safePath = (s: string) => s.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  // Batch variant of addToTimeline: place many clips in ONE ExtendScript round-trip.
+  // The per-call file/WS round-trip (~seconds each, 60s timeout) is the real bottleneck when
+  // placing a whole edit; looping inside one script collapses N round-trips into 1. Mirrors the
+  // single-clip logic: audio-only routing by extension, Source-monitor in/out marking (mediaType
+  // 4 with per-stream + no-arg fallbacks), overwriteClip. Returns a per-clip result array so a
+  // single bad clip never sinks the batch.
+  async addToTimelineBatch(sequenceId: string, clips: Array<{ projectItemId: string; trackIndex: number; time: number; linkAudio?: boolean; sourceInPoint?: number; sourceOutPoint?: number }>): Promise<any> {
+    const specs = clips.map(c => ({
+      projectItemId: c.projectItemId,
+      trackIndex: c.trackIndex,
+      time: c.time,
+      // Mirror the single-call default (true = keep Premiere's native audio linking).
+      linkAudio: c.linkAudio === undefined ? true : c.linkAudio,
+      sourceInPoint: c.sourceInPoint === undefined ? null : c.sourceInPoint,
+      sourceOutPoint: c.sourceOutPoint === undefined ? null : c.sourceOutPoint,
+    }));
     const script = `
       try {
+        var sequence = __findSequence(${JSON.stringify(sequenceId)});
+        if (!sequence) {
+          return JSON.stringify({ success: false, error: "Sequence not found" });
+        }
+        var specs = ${JSON.stringify(specs)};
+        var results = [];
+        for (var c = 0; c < specs.length; c++) {
+          var spec = specs[c];
+          var r = { index: c, time: spec.time, success: false };
+          try {
+            var projectItem = __findProjectItem(spec.projectItemId);
+            if (!projectItem) { r.error = "Project item not found"; results.push(r); continue; }
+
+            var mediaPath = projectItem.getMediaPath ? projectItem.getMediaPath() : "";
+            var isAudioOnly = /\\.(mp3|wav|aif|aiff|m4a|aac|flac|ogg|wma)$/i.test(mediaPath);
+            var track = isAudioOnly ? sequence.audioTracks[spec.trackIndex] : sequence.videoTracks[spec.trackIndex];
+            if (!track) { r.error = "Track not found at index " + spec.trackIndex; results.push(r); continue; }
+
+            if (spec.sourceInPoint !== null && spec.sourceOutPoint !== null) {
+              try {
+                projectItem.setInPoint(spec.sourceInPoint, 4);
+                projectItem.setOutPoint(spec.sourceOutPoint, 4);
+              } catch (eio) {
+                try {
+                  projectItem.setInPoint(spec.sourceInPoint, 1);
+                  projectItem.setOutPoint(spec.sourceOutPoint, 1);
+                  projectItem.setInPoint(spec.sourceInPoint, 2);
+                  projectItem.setOutPoint(spec.sourceOutPoint, 2);
+                } catch (eio2) {
+                  try {
+                    projectItem.setInPoint(spec.sourceInPoint);
+                    projectItem.setOutPoint(spec.sourceOutPoint);
+                  } catch (eio3) {}
+                }
+              }
+            }
+
+            track.overwriteClip(projectItem, spec.time);
+
+            var placedClip = null;
+            for (var i = 0; i < track.clips.numItems; i++) {
+              var candidate = track.clips[i];
+              if (candidate && candidate.projectItem && candidate.projectItem.nodeId === projectItem.nodeId && Math.abs(candidate.start.seconds - spec.time) < 0.1) {
+                placedClip = candidate;
+                break;
+              }
+            }
+            // Same reasoning as the single-call path: never fall back to the last clip on
+            // the track. An unconfirmed placement here fed both this result row and the
+            // linkAudio=false sweep below, so one no-op could report a pre-existing clip
+            // as placed and delete an unrelated audio clip alongside it.
+            if (!placedClip) {
+              r.error = "Placement could not be confirmed: no clip from this project item appears at " + spec.time + "s on the target track. No linked audio was removed.";
+              results.push(r);
+              continue;
+            }
+
+            r.success = true;
+            r.id = placedClip.nodeId;
+            r.name = placedClip.name;
+            r.inPoint = placedClip.start.seconds;
+            r.outPoint = placedClip.end.seconds;
+
+            // linkAudio=false cleanup — mirror the single-call addToTimeline path so batch
+            // rebuild/overlay workflows don't reintroduce the silent embedded-audio overwrite
+            // bug. When a video-track clip's source carries an embedded audio stream, Premiere
+            // auto-links and overwrites its counterpart onto an audio track, which can DESTROY
+            // existing audio. When linkAudio is false, remove that counterpart at the same
+            // start time. The video on the target track is untouched.
+            r.linkAudio = spec.linkAudio;
+            r.unlinkedAudioRemoved = 0;
+            if (!isAudioOnly && spec.linkAudio === false) {
+              var videoStart = placedClip.start.seconds;
+              var tolerance = 0.1;
+              for (var at = 0; at < sequence.audioTracks.numTracks; at++) {
+                var audioTrack = sequence.audioTracks[at];
+                // iterate backwards because remove() may shift indices
+                for (var ai = audioTrack.clips.numItems - 1; ai >= 0; ai--) {
+                  var audioClip = audioTrack.clips[ai];
+                  if (audioClip && audioClip.projectItem &&
+                      audioClip.projectItem.nodeId === projectItem.nodeId &&
+                      Math.abs(audioClip.start.seconds - videoStart) < tolerance) {
+                    try {
+                      audioClip.remove(false, false); // ripple=false, alignToVideo=false
+                      r.unlinkedAudioRemoved++;
+                    } catch (rmErr) {
+                      // best effort — don't fail this clip over cleanup
+                    }
+                  }
+                }
+              }
+            }
+          } catch (e) {
+            r.error = e.toString();
+          }
+          results.push(r);
+        }
+        var placed = 0;
+        for (var k = 0; k < results.length; k++) { if (results[k].success) placed++; }
+        var failed = specs.length - placed;
+        // Aggregate status must reflect reality: success is true ONLY when every requested
+        // clip placed. placed===0 => failure; some-but-not-all => partial. Per-clip results[]
+        // still carry the detail. (PR #48 review: don't report success when placements failed.)
+        var allPlaced = (specs.length > 0 && placed === specs.length);
+        return JSON.stringify({
+          success: allPlaced,
+          status: (placed === 0 ? "failure" : (allPlaced ? "success" : "partial")),
+          placed: placed,
+          failed: failed,
+          total: specs.length,
+          results: results
+        });
+      } catch (e) {
+        return JSON.stringify({ success: false, error: e.toString() });
+      }
+    `;
+    return await this.executeScript(script, 300000);
+  }
+
+  async renderSequence(
+    sequenceId: string,
+    outputPath: string,
+    presetPath: string,
+    options: { sourceRange?: 'entire' | 'in_out' | 'work_area'; removeOnCompletion?: boolean } = {}
+  ): Promise<any> {
+    const sourceRange = options.sourceRange ?? 'entire';
+    const removeOnCompletion = options.removeOnCompletion ?? true;
+    const encoder = await this.findInstalledMediaEncoder();
+    if (encoder.available === false) {
+      return {
+        success: false,
+        status: 'failed',
+        code: 'MEDIA_ENCODER_NOT_INSTALLED',
+        error: 'Adobe Media Encoder is not installed. The export was not sent to Premiere, so no native Media Encoder warning was shown.',
+        searchedPaths: encoder.searchedPaths,
+        outputPath,
+        presetPath,
+        sourceRange,
+      };
+    }
+    const script = `
+      try {
+        var sequenceId = ${JSON.stringify(sequenceId)};
+        var outputPath = ${JSON.stringify(outputPath)};
+        var presetPath = ${JSON.stringify(presetPath)};
+        var sourceRange = ${JSON.stringify(sourceRange)};
+        var removeOnCompletion = ${removeOnCompletion ? 1 : 0};
+        var warnings = [];
+
+        function secondsOf(value) {
+          if (value === null || typeof value === "undefined") return 0;
+          try {
+            if (typeof value.ticks !== "undefined") return Number(value.ticks) / 254016000000.0;
+            if (typeof value.seconds !== "undefined") {
+              var secondsValue = Number(value.seconds);
+              return Math.abs(secondsValue) > 1000000 ? secondsValue / 254016000000.0 : secondsValue;
+            }
+          } catch (_) {}
+          var numeric = Number(value);
+          if (Math.abs(numeric) > 1000000) return numeric / 254016000000.0;
+          return isNaN(numeric) ? 0 : numeric;
+        }
+
+        function rangeFailure(code, message, details) {
+          var payload = {
+            success: false,
+            status: "failed",
+            code: code,
+            error: message,
+            sourceRange: sourceRange,
+            outputPath: outputPath,
+            presetPath: presetPath,
+            warnings: warnings
+          };
+          if (details) {
+            for (var key in details) {
+              if (details.hasOwnProperty(key)) payload[key] = details[key];
+            }
+          }
+          return JSON.stringify(payload);
+        }
+
         // Premiere 2026 dropped getSequenceByID; iterate via __findSequence helper.
         // Fail hard if the requested sequence isn't found — silently falling back to
         // app.project.activeSequence would queue/render the wrong timeline while still
         // reporting success, masking caller bugs (stale IDs, etc.).
-        var sequence = __findSequence("${sequenceId}");
+        var sequence = __findSequence(sequenceId);
         if (!sequence) {
-          return JSON.stringify({ success: false, error: "Sequence not found by id: ${sequenceId}" });
+          return rangeFailure("SEQUENCE_NOT_FOUND", "Sequence not found by id: " + sequenceId);
         }
         if (typeof app.encoder === "undefined") {
-          return JSON.stringify({ success: false, error: "app.encoder not available in this Premiere build" });
+          return rangeFailure("ENCODER_UNAVAILABLE", "app.encoder not available in this Premiere build");
         }
 
         // Boot AME if not already running so it can pick up the queue
-        try { app.encoder.launchEncoder(); } catch (e1) {}
+        try { app.encoder.launchEncoder(); }
+        catch (e1) {
+          warnings.push({ code: "LAUNCH_ENCODER_FAILED", message: e1.toString() });
+        }
 
-        // Queue range constants on app.encoder: ENCODE_ENTIRE / ENCODE_IN_TO_OUT / ENCODE_WORKAREA
-        var range = (typeof app.encoder.ENCODE_ENTIRE !== "undefined") ? app.encoder.ENCODE_ENTIRE : 0;
+        var sequenceEnd = secondsOf(sequence.end);
+        var sequenceIn = 0;
+        var sequenceOut = 0;
+        try { sequenceIn = secondsOf(sequence.getInPointAsTime()); } catch (inReadError) {}
+        try { sequenceOut = secondsOf(sequence.getOutPointAsTime()); } catch (outReadError) {}
+        var inMarked = sequenceIn > 0;
+        var outMarked = sequenceOut > 0;
+        var range = null;
+        var encoderRangeConstant = "";
+        var resolvedRange = {
+          "in": 0,
+          "out": sequenceEnd,
+          inMarked: inMarked,
+          outMarked: outMarked,
+          sequenceEnd: sequenceEnd
+        };
 
-        // 5th arg "removeOnCompletion": 1=remove, 0=keep. We use 1 to avoid AME queue clutter.
+        if (sourceRange === "in_out") {
+          if (!inMarked && !outMarked) {
+            return rangeFailure("IN_OUT_UNSET", "sourceRange in_out requested, but sequence In and Out are both unset.", { resolvedRange: resolvedRange });
+          }
+          if (!outMarked) {
+            return rangeFailure("OUT_POINT_UNSET", "sourceRange in_out requested, but sequence Out is unset.", { resolvedRange: resolvedRange });
+          }
+          resolvedRange.in = inMarked ? sequenceIn : 0;
+          resolvedRange.out = sequenceOut;
+          if (resolvedRange.out <= resolvedRange.in) {
+            return rangeFailure("INVALID_IN_OUT_RANGE", "sourceRange in_out requires Out to be greater than In.", { resolvedRange: resolvedRange });
+          }
+          if (sequenceEnd > 0 && resolvedRange.out > sequenceEnd + 0.001) {
+            return rangeFailure("OUT_POINT_BEYOND_SEQUENCE_END", "Sequence Out exceeds the physical sequence end.", { resolvedRange: resolvedRange });
+          }
+          encoderRangeConstant = "ENCODE_IN_TO_OUT";
+        } else if (sourceRange === "work_area") {
+          var workIn = 0;
+          var workOut = 0;
+          try { workIn = secondsOf(sequence.getWorkAreaInPointAsTime()); } catch (workInReadError) {}
+          try { workOut = secondsOf(sequence.getWorkAreaOutPointAsTime()); } catch (workOutReadError) {}
+          resolvedRange = {
+            "in": workIn,
+            "out": workOut,
+            inMarked: workIn > 0,
+            outMarked: workOut > 0,
+            sequenceEnd: sequenceEnd
+          };
+          if (workOut <= workIn) {
+            return rangeFailure("INVALID_WORK_AREA_RANGE", "sourceRange work_area requires Work Area Out to be greater than Work Area In.", { resolvedRange: resolvedRange });
+          }
+          if (sequenceEnd > 0 && workOut > sequenceEnd + 0.001) {
+            return rangeFailure("WORK_AREA_BEYOND_SEQUENCE_END", "Work Area Out exceeds the physical sequence end.", { resolvedRange: resolvedRange });
+          }
+          encoderRangeConstant = "ENCODE_WORKAREA";
+        } else if (sourceRange === "entire") {
+          encoderRangeConstant = "ENCODE_ENTIRE";
+        } else {
+          return rangeFailure("INVALID_SOURCE_RANGE", "Unsupported sourceRange: " + sourceRange);
+        }
+
+        if (typeof app.encoder[encoderRangeConstant] === "undefined") {
+          return rangeFailure("ENCODER_RANGE_UNAVAILABLE", "Requested encoder range constant is unavailable: " + encoderRangeConstant, {
+            encoderRangeConstant: encoderRangeConstant,
+            resolvedRange: resolvedRange
+          });
+        }
+        range = app.encoder[encoderRangeConstant];
+
         var jobID = app.encoder.encodeSequence(
           sequence,
-          "${safePath(outputPath)}",
-          "${safePath(presetPath)}",
+          outputPath,
+          presetPath,
           range,
-          1
+          removeOnCompletion
         );
 
         if (!jobID) {
           return JSON.stringify({
             success: false,
+            status: "failed",
             error: "encodeSequence returned no jobID — preset path may be invalid or AME not connected",
-            outputPath: "${safePath(outputPath)}",
-            presetPath: "${safePath(presetPath)}"
+            outputPath: outputPath,
+            presetPath: presetPath,
+            sourceRange: sourceRange,
+            resolvedRange: resolvedRange,
+            encoderRangeConstant: encoderRangeConstant,
+            warnings: warnings
           });
         }
 
         // Trigger AME to actually start processing the queued job
-        try { app.encoder.startBatch(); } catch (e2) {}
+        var queueStarted = false;
+        try {
+          var startBatchResult = app.encoder.startBatch();
+          queueStarted = startBatchResult !== false;
+        } catch (e2) {
+          warnings.push({ code: "START_BATCH_FAILED", message: e2.toString() });
+        }
 
         return JSON.stringify({
           success: true,
+          status: "queued",
           queued: true,
+          queueStarted: queueStarted,
           jobID: String(jobID),
-          outputPath: "${safePath(outputPath)}",
-          presetPath: "${safePath(presetPath)}"
+          outputPath: outputPath,
+          presetPath: presetPath,
+          sourceRange: sourceRange,
+          resolvedRange: resolvedRange,
+          encoderRangeConstant: encoderRangeConstant,
+          removeOnCompletion: !!removeOnCompletion,
+          warnings: warnings
         });
       } catch (e) {
         return JSON.stringify({ success: false, error: "encodeSequence threw: " + e.toString() });
@@ -758,6 +1626,43 @@ export class PremiereProBridge implements PremiereProTransport {
       try { return JSON.parse(raw); } catch { return { success: false, error: "Bridge returned unparseable string: " + raw }; }
     }
     return raw;
+  }
+
+  /**
+   * Avoid calling app.encoder.launchEncoder() when AME is absent: Premiere shows
+   * a blocking native warning in that case. An unreadable install directory is
+   * treated as unknown, so a transient filesystem error does not disable export.
+   */
+  private async findInstalledMediaEncoder(): Promise<{ available: boolean; searchedPaths: string[] }> {
+    if (process.platform === 'darwin') {
+      const applications = '/Applications';
+      try {
+        const entries = await fs.readdir(applications);
+        const found = entries.some((entry) => /^Adobe Media Encoder(?: \d+)?\.app$/i.test(entry));
+        return { available: found, searchedPaths: [applications] };
+      } catch {
+        return { available: true, searchedPaths: [applications] };
+      }
+    }
+
+    if (process.platform === 'win32') {
+      const roots = [process.env.ProgramFiles, process.env['ProgramFiles(x86)']].filter((value): value is string => Boolean(value));
+      const searchedPaths = roots.map((root) => join(root, 'Adobe'));
+      if (searchedPaths.length === 0) return { available: true, searchedPaths };
+      try {
+        for (const directory of searchedPaths) {
+          const entries = await fs.readdir(directory);
+          if (entries.some((entry) => /^Adobe Media Encoder(?: \d+)?$/i.test(entry))) {
+            return { available: true, searchedPaths };
+          }
+        }
+        return { available: false, searchedPaths };
+      } catch {
+        return { available: true, searchedPaths };
+      }
+    }
+
+    return { available: true, searchedPaths: [] };
   }
 
   async listProjectItems(): Promise<PremiereProProjectItem[]> {
