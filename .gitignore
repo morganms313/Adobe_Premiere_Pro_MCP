@@ -19,3 +19,6 @@ release-artifacts/
 
 # Local rollback snapshots written by scripts/adopt-mcp-version.sh
 .mcp-backups/
+
+# Cloudflare
+.wrangler/

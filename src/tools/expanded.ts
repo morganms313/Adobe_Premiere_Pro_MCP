@@ -1,9 +1,11 @@
 import { z } from 'zod';
 import { promises as fs } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { deflateSync } from 'node:zlib';
 import type { PremiereProTransport } from '../bridge/types.js';
-import type { MCPTool } from './index.js';
+import { bridgeUnavailableResult, isBridgeUnavailableMessage } from '../bridge/errors.js';
+import type { MCPTool } from './types.js';
 
 export const expandedToolNames = [
   'find_items_by_media_path',
@@ -95,7 +97,6 @@ export const expandedToolNames = [
   'create_sequence_from_preset',
   'attach_custom_property',
   'get_export_file_extension',
-  'remove_effect',
   'set_xmp_metadata',
   'capture_frame',
   'export_omf',
@@ -106,7 +107,6 @@ export const expandedToolNames = [
   'slide_edit',
   'slip_edit',
   'move_clip_to_track',
-  'remove_all_effects',
   'set_clip_speed_qe',
   'set_frame_blend',
   'set_time_interpolation',
@@ -133,7 +133,6 @@ export const expandedToolNames = [
   'copy_effect_values',
   'replace_clip_media',
   'batch_apply_effect',
-  'remove_effect_by_name',
   'set_blend_mode',
   'set_all_tracks_targeted',
   'razor_all_tracks',
@@ -181,14 +180,73 @@ export const expandedToolNames = [
 
 export const unimplementedExpandedToolNames = [] as const;
 
+const EXPANDED_REQUIRED_CLIP_ID = new Set([
+  'ripple_delete',
+  'roll_edit',
+  'slide_edit',
+  'slip_edit',
+  'move_clip_to_track',
+  'set_clip_speed_qe',
+  'set_frame_blend',
+  'set_time_interpolation',
+  'set_color_value',
+  'set_effect_property',
+  'remove_keyframe_range',
+  'set_keyframe_interpolation',
+  'get_value_at_time',
+  'set_blend_mode',
+  'set_clip_start_time',
+  'set_clip_position',
+  'set_clip_scale',
+  'set_clip_rotation',
+  'set_clip_anchor_point',
+  'set_clip_opacity',
+  'set_clip_volume',
+  'set_clip_pan',
+  'set_anti_alias_quality',
+  'set_uniform_scale',
+  'set_scale_width_height',
+  'freeze_frame',
+]);
+
+const EXPANDED_REQUIRED_PROJECT_ITEM_ID = new Set([
+  'replace_clip_media',
+  'delete_bin',
+  'rename_bin',
+  'add_custom_metadata_field',
+  'set_offline',
+  'has_proxy',
+  'detach_proxy',
+  'set_override_frame_rate',
+  'set_override_pixel_aspect_ratio',
+  'set_scale_to_frame_size',
+  'select_item',
+  'set_start_time',
+  'attach_custom_property',
+  'set_xmp_metadata',
+  'encode_project_item',
+  'set_poster_frame',
+  'delete_project_item',
+]);
+
 export function getExpandedTools(existingNames: Set<string>): MCPTool[] {
   return expandedToolNames
     .filter((name) => !existingNames.has(name))
-    .map((name) => ({
-      name,
-      description: `Premiere Pro expanded operation: ${name.replace(/_/g, ' ')}.`,
-      inputSchema: z.record(z.string(), z.any())
-    }));
+    .map((name) => {
+      let inputSchema: z.ZodTypeAny = z.record(z.string(), z.any());
+      if (EXPANDED_REQUIRED_CLIP_ID.has(name)) {
+        inputSchema = z.object({ clipId: z.string().min(1).describe('Timeline clip id') }).passthrough();
+      } else if (EXPANDED_REQUIRED_PROJECT_ITEM_ID.has(name)) {
+        inputSchema = z.object({
+          projectItemId: z.string().min(1).describe('Project item id from list_project_items'),
+        }).passthrough();
+      }
+      return {
+        name,
+        description: `Premiere Pro expanded operation: ${name.replace(/_/g, ' ')}.`,
+        inputSchema,
+      };
+    });
 }
 
 export function isExpandedTool(name: string): boolean {
@@ -226,27 +284,21 @@ export async function executeExpandedTool(
       return await bridge.executeScript(script, undefined, true);
     }
 
+    if (name === 'capture_frame' && !args.outputPath && !args.path) {
+      args = { ...args, outputPath: join(tmpdir(), `premiere-mcp-frame-${Date.now()}.png`) };
+    }
     const script = buildExpandedToolScript(name, args);
     const timeoutMs = name === 'ping' ? 8000 : undefined;
     return await bridge.executeScript(script, timeoutMs);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    const bridgeDown =
-      message.toLowerCase().includes('mcp bridge is not running') ||
-      message.toLowerCase().includes('start bridge') ||
-      message.toLowerCase().includes('bridge response timeout');
+    if (isBridgeUnavailableMessage(message)) {
+      return bridgeUnavailableResult(name, message);
+    }
     return {
       success: false,
       tool: name,
       error: message,
-      ...(bridgeDown
-        ? {
-            retry: false,
-            status: 'bridge_unavailable',
-            nextStep:
-              'Open Premiere Pro → Window > Extensions > MCP Bridge → click Start Bridge. Do not retry until the panel says Connected.',
-          }
-        : {}),
     };
   }
 }
@@ -622,12 +674,7 @@ function buildExpandedToolScript(name: string, args: Record<string, any>): strin
       return app.project && app.project.activeSequence ? app.project.activeSequence : null;
     }
     function findSequence(idOrName) {
-      if (!app.project || !app.project.sequences) return null;
-      for (var i = 0; i < app.project.sequences.numSequences; i++) {
-        var seq = app.project.sequences[i];
-        if (seq.sequenceID === idOrName || seq.name === idOrName) return seq;
-      }
-      return null;
+      return __findSequence(idOrName);
     }
     // Returns an error message when the caller named a sequence that does not
     // resolve, and null otherwise. targetSequence() already distinguishes "no id
@@ -684,6 +731,19 @@ function buildExpandedToolScript(name: string, args: Record<string, any>): strin
         var activeCandidate = qe.project.getActiveSequence();
         if (activeCandidate && String(activeCandidate.guid) === String(seq.sequenceID)) return activeCandidate;
       } catch (eActive) {}
+      // Premiere 26: openInTimeline is missing and getSequenceAt throws for every
+      // index. Activating the DOM sequence is what makes QE address it.
+      try {
+        if (typeof app.project.openSequence === "function") app.project.openSequence(seq.sequenceID);
+      } catch (eOpen) {}
+      try { app.project.activeSequence = seq; } catch (eSet) {}
+      try { if (seq.openInTimeline) seq.openInTimeline(); } catch (eTL) {}
+      try { if (typeof $ !== "undefined" && $.sleep) $.sleep(250); } catch (eSleep) {}
+      try { app.enableQE(); } catch (eEnable2) {}
+      try {
+        activeCandidate = qe.project.getActiveSequence();
+        if (activeCandidate && String(activeCandidate.guid) === String(seq.sequenceID)) return activeCandidate;
+      } catch (eActivated) {}
       return null;
     }
     function sequenceRequestError() {
@@ -719,13 +779,7 @@ function buildExpandedToolScript(name: string, args: Record<string, any>): strin
       }
     }
     function findItem(idOrName) {
-      if (!app.project || !app.project.rootItem) return null;
-      var found = null;
-      var wanted = String(idOrName);
-      walkItems(app.project.rootItem, function(item) {
-        if (!found && (__idsMatch(item.nodeId, wanted) || item.name === idOrName || item.treePath === idOrName)) found = item;
-      });
-      return found;
+      return __resolveProjectItem(idOrName);
     }
     function allProjectItems() {
       var items = [];
@@ -807,11 +861,10 @@ function buildExpandedToolScript(name: string, args: Record<string, any>): strin
       return foundAnywhere;
     }
     function coerceProjectItemId(value) {
-      if (value == null) return "";
-      if (typeof value === "object") {
-        return String(value.projectItemId || value.nodeId || value.id || value.clipId || value.itemId || "");
-      }
-      return String(value);
+      return __coerceProjectItemId(value);
+    }
+    function expandIdList(value) {
+      return __expandIdList(value);
     }
     function clipInfo(clip, trackType, trackIndex, clipIndex) {
       var item = {
@@ -975,10 +1028,13 @@ function buildExpandedToolScript(name: string, args: Record<string, any>): strin
     }
     function findComponent(clip, componentName) {
       if (!clip || !clip.components) return null;
-      var wanted = normalizeName(componentName);
       for (var i = 0; i < clip.components.numItems; i++) {
         var component = clip.components[i];
-        if (normalizeName(component.displayName) === wanted || normalizeName(component.matchName) === wanted) return { component: component, index: i };
+        var matchName = "";
+        try { matchName = String(component.matchName || ""); } catch (eMatch) {}
+        if (__namesMatch(component.displayName, componentName) || __namesMatch(matchName, componentName)) {
+          return { component: component, index: i };
+        }
       }
       return null;
     }
@@ -995,15 +1051,15 @@ function buildExpandedToolScript(name: string, args: Record<string, any>): strin
     }
     function setComponentProperty(component, propertyName, value) {
       if (!component || !component.properties) return { ok: false, error: "Component has no properties" };
-      var wanted = normalizeName(propertyName);
       for (var i = 0; i < component.properties.numItems; i++) {
         var prop = component.properties[i];
-        if (normalizeName(prop.displayName) !== wanted) continue;
+        if (!__namesMatch(prop.displayName, propertyName)) continue;
         var before = null;
         var after = null;
         try { before = prop.getValue(); } catch (eBefore) {}
         try {
-          prop.setValue(value, true);
+          var coerced = __coercePropertyValue(prop, value, null);
+          prop.setValue(coerced, true);
           try { after = prop.getValue(); } catch (eAfter) {}
           return { ok: true, property: String(prop.displayName), before: before, after: after };
         } catch (eSet) {
@@ -1014,10 +1070,9 @@ function buildExpandedToolScript(name: string, args: Record<string, any>): strin
     }
     function getComponentProperty(component, propertyName) {
       if (!component || !component.properties) return { ok: false, error: "Component has no properties" };
-      var wanted = normalizeName(propertyName);
       for (var i = 0; i < component.properties.numItems; i++) {
         var prop = component.properties[i];
-        if (normalizeName(prop.displayName) !== wanted) continue;
+        if (!__namesMatch(prop.displayName, propertyName)) continue;
         try {
           return { ok: true, property: String(prop.displayName), value: prop.getValue() };
         } catch (eGet) {
@@ -1028,10 +1083,9 @@ function buildExpandedToolScript(name: string, args: Record<string, any>): strin
     }
     function findProperty(component, propertyName) {
       if (!component || !component.properties) return null;
-      var wanted = normalizeName(propertyName);
       for (var i = 0; i < component.properties.numItems; i++) {
         var prop = component.properties[i];
-        if (normalizeName(prop.displayName) === wanted) return prop;
+        if (__namesMatch(prop.displayName, propertyName)) return prop;
       }
       return null;
     }
@@ -1613,16 +1667,6 @@ function buildExpandedToolScript(name: string, args: Record<string, any>): strin
           else if (extensionPreset.indexOf("hdv") !== -1 || extensionPreset.indexOf("m2t") !== -1) extension = "m2t";
           return ok({ extension: extension, method: "presetPathFallback", presetPath: String(args.presetPath || args.preset || "") });
 
-        case "remove_effect":
-        case "remove_effect_by_name":
-          var removeEffectClip = findClip(args.clipId || args.node_id || args.nodeId);
-          if (!removeEffectClip) return fail(pendingSequenceError || "Clip not found");
-          var effectToRemove = findComponent(removeEffectClip.clip, args.effectName || args.name);
-          if (!effectToRemove) return ok({ removed: true, changed: false, effect: args.effectName || args.name, note: "Effect was already absent from clip" });
-          var removeEffectResult = tryCall(effectToRemove.component, ["remove", "delete"], []);
-          if (!removeEffectResult.called) return fail(removeEffectResult.error, { effect: args.effectName || args.name, note: "Premiere's public ExtendScript DOM often exposes effect read/set APIs without an effect removal API." });
-          return ok({ removed: true, effect: args.effectName || args.name, method: removeEffectResult.method });
-
         case "ripple_delete":
           if (!args.clipId && !args.node_id && !args.nodeId) return fail("ripple_delete requires clipId.");
           var rippleClip = findClip(args.clipId || args.node_id || args.nodeId);
@@ -1666,38 +1710,124 @@ function buildExpandedToolScript(name: string, args: Record<string, any>): strin
           if (!args.clipId && !args.node_id && !args.nodeId) return fail("move_clip_to_track requires clipId.");
           var moveTrackClip = findClip(args.clipId || args.node_id || args.nodeId);
           if (!moveTrackClip) return fail(pendingSequenceError || "Clip not found");
-          var moveTrackResult = tryCall(moveTrackClip.clip, ["moveToTrack", "setTrack"], [Number(args.trackIndex || args.newTrackIndex || 0)]);
-          if (moveTrackResult.called) return ok({ moved: true, trackIndex: Number(args.trackIndex || args.newTrackIndex || 0), method: moveTrackResult.method });
           var moveTargetIndex = Number(args.trackIndex || args.newTrackIndex || 0);
+          var allowOverwrite = Boolean(args.overwrite);
           var moveStart = valueOfTime(moveTrackClip.clip.start);
+          var moveEnd = valueOfTime(moveTrackClip.clip.end);
+          var moveDur = moveEnd - moveStart;
+          var moveIn = valueOfTime(moveTrackClip.clip.inPoint);
+          var moveOut = valueOfTime(moveTrackClip.clip.outPoint);
+          var moveDisabled = false;
+          try { moveDisabled = !!moveTrackClip.clip.disabled; } catch (eDis) {}
           var moveItem = moveTrackClip.clip.projectItem;
           if (!moveItem) return fail("Clip has no projectItem for move fallback");
           if (moveTrackClip.trackType === "video" && moveTargetIndex >= moveTrackClip.sequence.videoTracks.numTracks) return fail("Target video track out of range");
           if (moveTrackClip.trackType === "audio" && moveTargetIndex >= moveTrackClip.sequence.audioTracks.numTracks) return fail("Target audio track out of range");
-          var beforeTargetCount = moveTrackClip.trackType === "video" ? moveTrackClip.sequence.videoTracks[moveTargetIndex].clips.numItems : moveTrackClip.sequence.audioTracks[moveTargetIndex].clips.numItems;
-          moveTrackClip.clip.remove(false, true);
-          if (moveTrackClip.trackType === "video") moveTrackClip.sequence.overwriteClip(moveItem, secondsToTicks(moveStart), moveTargetIndex, 0);
-          else moveTrackClip.sequence.overwriteClip(moveItem, secondsToTicks(moveStart), 0, moveTargetIndex);
-          var afterTargetCount = moveTrackClip.trackType === "video" ? moveTrackClip.sequence.videoTracks[moveTargetIndex].clips.numItems : moveTrackClip.sequence.audioTracks[moveTargetIndex].clips.numItems;
-          if (afterTargetCount <= beforeTargetCount) return fail("Move fallback did not create a clip on the target track", { beforeTargetCount: beforeTargetCount, afterTargetCount: afterTargetCount });
-          return ok({ moved: true, trackIndex: moveTargetIndex, method: "remove+overwriteClip", start: moveStart, beforeTargetCount: beforeTargetCount, afterTargetCount: afterTargetCount });
-
-        case "remove_all_effects":
-          if (!args.clipId && !args.node_id && !args.nodeId) return fail("remove_all_effects requires clipId.");
-          var removeAllClip = findClip(args.clipId || args.node_id || args.nodeId);
-          if (!removeAllClip) return fail(pendingSequenceError || "Clip not found");
-          var removedEffects = [];
-          var failedEffects = [];
-          for (var rai = removeAllClip.clip.components.numItems - 1; rai >= 0; rai--) {
-            var componentToRemove = removeAllClip.clip.components[rai];
-            var componentName = String(componentToRemove.displayName);
-            if (normalizeName(componentName) === "motion" || normalizeName(componentName) === "opacity" || normalizeName(componentName) === "volume") continue;
-            var oneRemove = tryCall(componentToRemove, ["remove", "delete"], []);
-            if (oneRemove.called) removedEffects.push({ name: componentName, method: oneRemove.method });
-            else failedEffects.push({ name: componentName, error: oneRemove.error });
+          if (moveTargetIndex === moveTrackClip.trackIndex) {
+            return ok({ moved: true, changed: false, trackIndex: moveTargetIndex, method: "already on requested track", clipId: moveTrackClip.clip.nodeId });
           }
-          if (failedEffects.length) return fail("One or more effects could not be removed", { removed: removedEffects, failed: failedEffects });
-          return ok({ removed: removedEffects });
+          var destTrack = moveTrackClip.trackType === "video" ? moveTrackClip.sequence.videoTracks[moveTargetIndex] : moveTrackClip.sequence.audioTracks[moveTargetIndex];
+          var occupants = [];
+          var moveLastEnd = 0;
+          for (var oi = 0; oi < destTrack.clips.numItems; oi++) {
+            var other = destTrack.clips[oi];
+            if (__idsMatch(other.nodeId, moveTrackClip.clip.nodeId)) continue;
+            var otherStart = valueOfTime(other.start);
+            var otherEnd = valueOfTime(other.end);
+            if (otherEnd > moveLastEnd) moveLastEnd = otherEnd;
+            if (moveStart < otherEnd && otherStart < moveEnd) occupants.push(other);
+          }
+          if (occupants.length && !allowOverwrite) {
+            return fail("Destination track is occupied at that time. Pass overwrite:true to replace the occupant, or pick another track/time.", {
+              occupantId: occupants[0].nodeId,
+              occupantName: occupants[0].name,
+              occupantStart: valueOfTime(occupants[0].start),
+              occupantEnd: valueOfTime(occupants[0].end)
+            });
+          }
+          // Nothing is mutated before this point, so the refusal above costs the
+          // caller nothing. overwrite:true is the caller's sanction to clear the
+          // span, and the slide below will not overwrite on its own, so lift every
+          // overlapping occupant explicitly (ripple = false keeps the track's
+          // timing). Done ahead of the native attempt so both paths see the same
+          // destination.
+          if (occupants.length) {
+            for (var ori = occupants.length - 1; ori >= 0; ori--) occupants[ori].remove(false, true);
+          }
+          var nativeMove = tryCall(moveTrackClip.clip, ["moveToTrack", "setTrack"], [moveTargetIndex]);
+          if (nativeMove.called) {
+            return ok({ moved: true, trackIndex: moveTargetIndex, method: nativeMove.method, clipId: moveTrackClip.clip.nodeId });
+          }
+          // The fallback reinserts from the projectItem, and overwriteClip lays the
+          // item down at its OWN duration -- not the trimmed length of the timeline
+          // clip -- so writing straight at the destination can reach past
+          // [start, end) and destroy a neighbour the occupancy guard never looked
+          // at. Park past the last clip on the target track instead (guaranteed
+          // empty), trim there, then slide into the span the guard verified.
+          var moveParkTime = moveLastEnd + 1.0;
+          var moveCleanupParked = function (parkedClip) {
+            // Remove the parked copy so no failure path strands a full-length
+            // clip on the target track. Without a reference, sweep the park zone:
+            // it was empty before, so anything past the old last end is ours.
+            try {
+              if (parkedClip) { parkedClip.remove(false, true); return; }
+            } catch (eClean) {}
+            for (var ci = destTrack.clips.numItems - 1; ci >= 0; ci--) {
+              var leftover = destTrack.clips[ci];
+              try { if (leftover && valueOfTime(leftover.start) > moveLastEnd + 0.5) leftover.remove(false, true); } catch (eSweep) {}
+            }
+          };
+          destTrack.overwriteClip(moveItem, moveParkTime);
+          var placed = null;
+          for (var pi = 0; pi < destTrack.clips.numItems; pi++) {
+            var candidate = destTrack.clips[pi];
+            // By identity, not nearest start: if overwriteClip silently no-ops, a
+            // nearest-start pick would hand back a bystander and the trim below
+            // would rewrite its in/out.
+            if (candidate && candidate.projectItem && __idsMatch(candidate.projectItem.nodeId, moveItem.nodeId) && Math.abs(valueOfTime(candidate.start) - moveParkTime) < 0.2) { placed = candidate; break; }
+          }
+          if (!placed) {
+            moveCleanupParked(null);
+            return fail("Move fallback did not create a clip on the target track; the source clip was left in place.");
+          }
+          // Restore the source trim while parked. Order the assignments so inPoint
+          // never transiently exceeds outPoint, which the DOM rejects.
+          try {
+            if (moveIn <= valueOfTime(placed.outPoint)) {
+              placed.inPoint = secondsToTime(moveIn);
+              placed.outPoint = secondsToTime(moveOut);
+            } else {
+              placed.outPoint = secondsToTime(moveOut);
+              placed.inPoint = secondsToTime(moveIn);
+            }
+          } catch (eTrim) {}
+          // In/out alone do not shrink the timeline clip (trim_clip and
+          // replace_clip both write end for the same reason). Set the
+          // duration relative to the PARKED start -- moveEnd is an absolute
+          // time on the original timeline and would be wrong here.
+          try { placed.end = secondsToTime(valueOfTime(placed.start) + moveDur); } catch (eEnd) {}
+          try { placed.disabled = moveDisabled; } catch (eEn) {}
+          // Refuse to slide unless in, out AND duration all took: a full-length
+          // item slid into the span is exactly the neighbour overwrite the
+          // occupancy guard cannot see, since it only measured [start, end).
+          var trimRestored = Math.abs(valueOfTime(placed.inPoint) - moveIn) < 0.05 && Math.abs(valueOfTime(placed.outPoint) - moveOut) < 0.05 && Math.abs(valueOfTime(placed.end) - valueOfTime(placed.start) - moveDur) < 0.05;
+          if (!trimRestored) {
+            var placedIn = valueOfTime(placed.inPoint);
+            var placedOut = valueOfTime(placed.outPoint);
+            var placedDur = valueOfTime(placed.end) - valueOfTime(placed.start);
+            moveCleanupParked(placed);
+            return fail("Source trim could not be restored on the target track; the source clip was left in place.", { requestedIn: moveIn, requestedOut: moveOut, requestedDuration: moveDur, actualIn: placedIn, actualOut: placedOut, actualDuration: placedDur });
+          }
+          placed.move(moveStart - valueOfTime(placed.start));
+          if (Math.abs(valueOfTime(placed.start) - moveStart) > 0.05) {
+            var placedStart = valueOfTime(placed.start);
+            moveCleanupParked(placed);
+            return fail("Clip could not be slid into the destination span; the source clip was left in place.", { requestedStart: moveStart, actualStart: placedStart });
+          }
+          // Only now, with the copy verified at the destination, lift the original
+          // (ripple = false), so the source track's other clips keep their timing.
+          moveTrackClip.clip.remove(false, true);
+          return ok({ moved: true, trackIndex: moveTargetIndex, method: "park+trim+slide", start: moveStart, clipId: placed.nodeId, oldClipId: args.clipId || args.node_id || args.nodeId, trimRestored: true });
 
         case "set_clip_speed_qe":
           if (!args.clipId && !args.node_id && !args.nodeId) return fail("set_clip_speed_qe requires clipId.");
@@ -1748,11 +1878,23 @@ function buildExpandedToolScript(name: string, args: Record<string, any>): strin
 
         case "create_sequence_from_clips":
           if (!app.project || !app.project.createNewSequenceFromClips) return fail("app.project.createNewSequenceFromClips is unavailable");
-          var clipItemIds = args.projectItemIds || args.itemIds || args.ids || args.clipIds || args.clips || [];
-          if (typeof clipItemIds === "string") clipItemIds = [clipItemIds];
-          if (!clipItemIds.length && args.projectItemId) clipItemIds = [args.projectItemId];
-          if (args.itemId && clipItemIds.indexOf(args.itemId) === -1) clipItemIds = clipItemIds.concat([args.itemId]);
-          if (args.clipId && clipItemIds.indexOf(args.clipId) === -1) clipItemIds = clipItemIds.concat([args.clipId]);
+          var clipItemIds = [];
+          function mergeIds(value) {
+            var extra = expandIdList(value);
+            for (var mi = 0; mi < extra.length; mi++) {
+              var already = false;
+              for (var mj = 0; mj < clipItemIds.length; mj++) if (clipItemIds[mj] === extra[mi]) already = true;
+              if (!already) clipItemIds.push(extra[mi]);
+            }
+          }
+          mergeIds(args.projectItemIds);
+          mergeIds(args.itemIds);
+          mergeIds(args.ids);
+          mergeIds(args.clipIds);
+          mergeIds(args.clips);
+          mergeIds(args.projectItemId);
+          mergeIds(args.itemId);
+          mergeIds(args.clipId);
           var clipItems = [];
           var unresolvedIds = [];
           for (var csi = 0; csi < clipItemIds.length; csi++) {
@@ -2195,7 +2337,23 @@ function buildExpandedToolScript(name: string, args: Record<string, any>): strin
             if (!parText) return fail("pixelAspectRatio must be a positive number or an 'N:M' ratio string.");
             seqSettings.videoPixelAspectRatio = parText;
           }
-          if (toolName === "set_sequence_field_type") seqSettings.videoFieldType = String(args.fieldType || args.value || "No Fields");
+          if (toolName === "set_sequence_field_type") {
+            var fieldRaw = args.fieldType !== undefined ? args.fieldType : args.value;
+            var fieldNum = 0;
+            if (typeof fieldRaw === "number" && isFinite(fieldRaw)) {
+              fieldNum = fieldRaw < 0 ? Math.ceil(fieldRaw) : Math.floor(fieldRaw);
+            } else if (fieldRaw !== undefined && fieldRaw !== null && String(fieldRaw).trim() !== "") {
+              var fieldText = String(fieldRaw).toLowerCase().trim();
+              if (fieldText === "1" || fieldText.indexOf("upper") !== -1) fieldNum = 1;
+              else if (fieldText === "2" || fieldText.indexOf("lower") !== -1) fieldNum = 2;
+              else if (fieldText === "0" || fieldText.indexOf("no field") !== -1 || fieldText.indexOf("progressive") !== -1 || fieldText === "none") fieldNum = 0;
+              else {
+                var parsedField = Number(fieldText);
+                fieldNum = isFinite(parsedField) ? (parsedField < 0 ? Math.ceil(parsedField) : Math.floor(parsedField)) : 0;
+              }
+            }
+            seqSettings.videoFieldType = fieldNum;
+          }
           if (toolName === "set_sequence_display_format") seqSettings.videoDisplayFormat = args.displayFormat || args.value || seqSettings.videoDisplayFormat;
           settingsSeq.setSettings(seqSettings);
           return ok({ sequenceId: settingsSeq.sequenceID, settings: seqSettings });
@@ -2299,7 +2457,7 @@ function buildExpandedToolScript(name: string, args: Record<string, any>): strin
             try { frameSeq.openInTimeline(); } catch (frameOpenError) {}
           }
           app.enableQE();
-          var qeFrameSeq = qeSequenceFor(frameSeq);
+          var qeFrameSeq = __qeSequenceForRetry(frameSeq);
           if (!qeFrameSeq) return fail("Could not address sequence '" + frameSeq.name + "' through the QE API.");
           var frameFormat = String(args.format || "png").toLowerCase();
           var frameMethod = frameFormat === "jpg" || frameFormat === "jpeg" ? "exportFrameJPEG" : (frameFormat === "tiff" || frameFormat === "tif" ? "exportFrameTiff" : "exportFramePNG");
@@ -2312,6 +2470,9 @@ function buildExpandedToolScript(name: string, args: Record<string, any>): strin
             frameTime.seconds = frameSeconds;
             frameTicks = frameTime.ticks;
           } catch (frameTimeError) {}
+          var frameFps = 30;
+          try { frameFps = frameSeq.timebase ? (254016000000 / parseInt(frameSeq.timebase, 10)) : 30; } catch (eFps) {}
+          var frameTimecode = __secondsToTimecode(frameSeconds, frameFps);
           var frameExportError = null;
           function tryFrameExport(arg1, arg2) {
             try {
@@ -2323,6 +2484,8 @@ function buildExpandedToolScript(name: string, args: Record<string, any>): strin
             }
           }
           var frameExported =
+            tryFrameExport(frameTimecode, framePath) ||
+            tryFrameExport(framePath, frameTimecode) ||
             tryFrameExport(frameSeconds, framePath) ||
             tryFrameExport(framePath, frameSeconds) ||
             tryFrameExport(frameTimeString, framePath) ||
@@ -2571,7 +2734,6 @@ function buildExpandedToolScript(name: string, args: Record<string, any>): strin
           if (app.sourceMonitor && app.sourceMonitor.openProjectItem) app.sourceMonitor.openProjectItem(matchClip.clip.projectItem);
           return ok({ matched: true, clipId: matchClip.clip.nodeId, item: matchClip.clip.projectItem.name, time: matchTime, method: "sourceMonitor.openProjectItem" });
 
-        case "capture_frame":
         case "get_project_scratch_disks":
         case "get_project_panel_metadata":
         case "get_xmp_metadata":

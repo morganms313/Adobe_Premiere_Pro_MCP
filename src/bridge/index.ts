@@ -6,21 +6,37 @@
  */
 
 import { Logger } from '../utils/logger.js';
-import { ChildProcess } from 'child_process';
+import { spawn, execFile, type ChildProcess } from 'node:child_process';
+import { promisify } from 'node:util';
 import { randomUUID } from 'node:crypto';
 import { promises as fs } from 'fs';
-import { extname, join } from 'path';
+import { extname, join, posix as pathPosix, win32 as pathWin32 } from 'path';
 import { createSecureTempDir, validateFilePath } from '../utils/security.js';
-import type { PremiereProTransport } from './types.js';
+import type { EnsureHostOptions, EnsureHostResult, PremiereProTransport } from './types.js';
+
+const execFileAsync = promisify(execFile);
 
 export const BRIDGE_HEARTBEAT_FILE = 'bridge-heartbeat.json';
 export const BRIDGE_PANEL_ABSENT_MS = 1500;
 export const BRIDGE_HEARTBEAT_STALE_MS = 2500;
 export const HEALTH_CHECK_TIMEOUT_MS = 8000;
 export const BRIDGE_PANEL_NOT_RUNNING =
-  'MCP Bridge is not running. Open Premiere Pro, choose Window > Extensions > MCP Bridge, then click Start Bridge. Do not retry until the panel says Connected.';
+  'MCP Bridge is not running. Open Adobe Premiere Pro. The MCP Bridge panel auto-starts when Premiere opens it. If the panel is missing, choose Window > Extensions > MCP Bridge. Call verify_premiere_connection once rather than retrying other tools.';
 export const BRIDGE_NOT_STARTED =
-  'MCP Bridge panel is open but Start Bridge has not been clicked. Click Start Bridge, wait until it says Connected, then retry once.';
+  'MCP Bridge panel is open but the bridge is not started. Click Start Bridge, wait until it says Connected, then retry once.';
+export const PREMIERE_LAUNCH_WAIT_MS = 45000;
+
+/**
+ * Join Premiere install/launch paths using `process.platform`, not the OS
+ * Node's default `path.join` was compiled for. Tests stub `process.platform`
+ * to `darwin`/`win32`; on Windows CI the default joiner still uses
+ * backslashes, which turned `open -a /Applications/...` into
+ * `open -a \\Applications\\...`.
+ */
+export function joinPremiereHostPath(...segments: string[]): string {
+  const joiner = process.platform === 'win32' ? pathWin32.join : pathPosix.join;
+  return joiner(...segments);
+}
 
 
 const UNSUPPORTED_MODAL_PRONE_IMPORT_EXTENSIONS = new Set([
@@ -303,15 +319,33 @@ function __mcpParse(text) {
 }
 JSON.parse = __mcpParse;
 function __findSequence(id) {
-  if (!app.project || !app.project.sequences) return null;
+  if (!app.project || !app.project.sequences || id == null || id === "") return null;
+  var wanted = String(id);
+  var nameHits = [];
   for (var i = 0; i < app.project.sequences.numSequences; i++) {
-    if (app.project.sequences[i].sequenceID === id) return app.project.sequences[i];
+    var seq = app.project.sequences[i];
+    if (String(seq.sequenceID) === wanted || __idsMatch(seq.sequenceID, wanted)) return seq;
+    try {
+      if (seq.projectItem && (__idsMatch(seq.projectItem.nodeId, wanted) || seq.projectItem.treePath === wanted)) return seq;
+    } catch (ePI) {}
+    if (seq.name === wanted) nameHits.push(seq);
+  }
+  if (nameHits.length) return nameHits[0];
+  var item = __findProjectItem(wanted);
+  if (item) {
+    for (var j = 0; j < app.project.sequences.numSequences; j++) {
+      var s2 = app.project.sequences[j];
+      try {
+        if (s2.projectItem === item) return s2;
+        if (s2.projectItem && __idsMatch(s2.projectItem.nodeId, item.nodeId)) return s2;
+      } catch (e2) {}
+      if (s2.name === item.name) return s2;
+    }
   }
   return null;
 }
-function __qeSequenceFor(seq) {
+function __qeSequenceLookup(seq) {
   if (!seq) return null;
-  try { app.enableQE(); } catch (eEnable) { return null; }
   var count = 0;
   try { count = qe.project.numSequences; } catch (eCount) { return null; }
   for (var qi = 0; qi < count; qi++) {
@@ -335,6 +369,28 @@ function __qeSequenceFor(seq) {
     if (activeCandidate && String(activeCandidate.guid) === String(seq.sequenceID)) return activeCandidate;
   } catch (eActive) {}
   return null;
+}
+function __activateSequenceForQE(seq) {
+  if (!seq) return;
+  // Premiere 26: Sequence.openInTimeline is missing, and getSequenceAt throws
+  // "Unknown error exception" for every index. QE can still address a sequence
+  // after it is the active timeline. openSequence(id) and assigning
+  // activeSequence are the APIs that actually work.
+  try {
+    if (typeof app.project.openSequence === "function") app.project.openSequence(seq.sequenceID);
+  } catch (eOpen) {}
+  try { app.project.activeSequence = seq; } catch (eSet) {}
+  try { if (seq.openInTimeline) seq.openInTimeline(); } catch (eTL) {}
+  try { if (typeof $ !== "undefined" && $.sleep) $.sleep(250); } catch (eSleep) {}
+}
+function __qeSequenceFor(seq) {
+  if (!seq) return null;
+  try { app.enableQE(); } catch (eEnable) { return null; }
+  var found = __qeSequenceLookup(seq);
+  if (found) return found;
+  __activateSequenceForQE(seq);
+  try { app.enableQE(); } catch (eEnable2) {}
+  return __qeSequenceLookup(seq);
 }
 function __findQeClipByDomClip(qeTrack, domClip) {
   // QE track items are not the DOM clip list: they include gaps and
@@ -447,9 +503,12 @@ function __samePath(a, b) {
   return normalize(a) === normalize(b);
 }
 function __findProjectItem(nodeId) {
-  if (!app.project || !app.project.rootItem) return null;
+  if (!app.project || !app.project.rootItem || nodeId == null || nodeId === "") return null;
+  function matches(item) {
+    return __idsMatch(item.nodeId, nodeId) || item.name === nodeId || item.treePath === nodeId;
+  }
   function walk(item) {
-    if (__idsMatch(item.nodeId, nodeId)) return item;
+    if (matches(item)) return item;
     if (item.children) {
       for (var i = 0; i < item.children.numItems; i++) {
         var found = walk(item.children[i]);
@@ -460,13 +519,288 @@ function __findProjectItem(nodeId) {
   }
   return walk(app.project.rootItem);
 }
-function __ticksToSeconds(ticks) {
-  return parseInt(ticks, 10) / 254016000000;
+function __resolveProjectItem(id) {
+  var item = __findProjectItem(id);
+  if (item) return item;
+  var clipInfo = __findClip(id);
+  if (clipInfo && clipInfo.clip && clipInfo.clip.projectItem) return clipInfo.clip.projectItem;
+  return null;
 }
+function __foldName(s) {
+  s = String(s || "").toLowerCase();
+  var from = "àáâãäåèéêëìíîïòóôõöùúûüýÿñçß";
+  var to = "aaaaaaeeeeiiiiooooouuuuyyncs";
+  var out = "";
+  for (var i = 0; i < s.length; i++) {
+    var ch = s.charAt(i);
+    var idx = from.indexOf(ch);
+    out += idx >= 0 ? to.charAt(idx) : ch;
+  }
+  return out.split(" ").join("").split("_").join("").split("-").join("").split("/").join("");
+}
+function __canonicalName(s) {
+  var n = __foldName(s);
+  var aliases = {
+    motion: "motion", movimento: "motion", mouvement: "motion", bewegung: "motion", movimiento: "motion",
+    opacity: "opacity", opacite: "opacity", opazitat: "opacity", opacidad: "opacity", opacita: "opacity",
+    volume: "volume", volumen: "volume", lautstarke: "volume",
+    scale: "scale", escala: "scale", echelle: "scale", skalierung: "scale", scala: "scale",
+    uniformscale: "scale", scalewidth: "scale", scaleheight: "scale",
+    position: "position", posicion: "position", posizione: "position", positionx: "position", positiony: "position",
+    posx: "position", posy: "position",
+    rotation: "rotation", rotacion: "rotation", rotazione: "rotation", drehung: "rotation",
+    level: "level", nivel: "level", pegel: "level", niveau: "level", livello: "level",
+    gaussianblur: "gaussianblur", flougaussien: "gaussianblur", gausscherweichzeichner: "gaussianblur",
+    desenfocadogaussiano: "gaussianblur",
+    crop: "crop", recortar: "crop", recadrage: "crop", beschneiden: "crop",
+    lumetricolor: "lumetricolor",
+    exposure: "exposure", exposition: "exposure", belichtung: "exposure", esposizione: "exposure",
+    contrast: "contrast", contraste: "contrast", kontrast: "contrast", contrasto: "contrast",
+    saturation: "saturation", saturacion: "saturation", sattigung: "saturation", saturazione: "saturation",
+    temperature: "temperature", temperatura: "temperature", temperatur: "temperature",
+    tint: "tint", tinta: "tint",
+    highlights: "highlights", altasluces: "highlights", hauteslumieres: "highlights",
+    shadows: "shadows", sombras: "shadows", ombres: "shadows",
+    crossdissolve: "crossdissolve", disolucioncruzada: "crossdissolve", fonduenchaine: "crossdissolve",
+    uberblendung: "crossdissolve", dissolvenzacruise: "crossdissolve"
+  };
+  return aliases[n] || n;
+}
+function __namesMatch(a, b) {
+  if (a == null || b == null) return false;
+  if (String(a) === String(b)) return true;
+  return __canonicalName(a) === __canonicalName(b);
+}
+function __resolveClipProperty(clip, componentName, paramName) {
+  if (!clip || !clip.components) {
+    return { ok: false, error: "Clip has no components", available: [] };
+  }
+  var wantComp = __canonicalName(componentName);
+  var wantParam = __canonicalName(paramName);
+  var rawParam = __foldName(paramName);
+  var axis = null;
+  if (rawParam === "positionx" || rawParam === "posx") axis = "x";
+  if (rawParam === "positiony" || rawParam === "posy") axis = "y";
+  var searchComps = [wantComp];
+  if (wantParam === "opacity") searchComps.push("opacity");
+  if (wantParam === "level") searchComps.push("volume");
+  var available = [];
+  var matchedComp = null;
+  var matchedParam = null;
+  for (var i = 0; i < clip.components.numItems; i++) {
+    var comp = clip.components[i];
+    var cName = String(comp.displayName);
+    var cMatch = "";
+    try { cMatch = String(comp.matchName || ""); } catch (eM) {}
+    var props = [];
+    for (var j = 0; j < comp.properties.numItems; j++) {
+      props.push(String(comp.properties[j].displayName));
+    }
+    available.push({ component: cName, matchName: cMatch, properties: props });
+    var compHits = false;
+    for (var sc = 0; sc < searchComps.length; sc++) {
+      if (__canonicalName(cName) === searchComps[sc] || __canonicalName(cMatch) === searchComps[sc]) {
+        compHits = true;
+      }
+    }
+    if (!compHits) continue;
+    if (!matchedComp) matchedComp = comp;
+    for (var k = 0; k < comp.properties.numItems; k++) {
+      var p = comp.properties[k];
+      if (__canonicalName(p.displayName) === wantParam) {
+        matchedParam = p;
+        break;
+      }
+    }
+    if (matchedParam) break;
+  }
+  if (!matchedParam) {
+    return {
+      ok: false,
+      error: "Parameter " + paramName + " not found in component " + componentName,
+      available: available
+    };
+  }
+  return { ok: true, component: matchedComp, property: matchedParam, axis: axis, available: available };
+}
+function __coercePropertyValue(property, value, axis) {
+  var current = null;
+  try { current = property.getValue(); } catch (eGet) {}
+  var currentIsArray = Object.prototype.toString.call(current) === "[object Array]";
+  var valueIsArray = Object.prototype.toString.call(value) === "[object Array]";
+  if (axis && currentIsArray) {
+    var next = [];
+    for (var i = 0; i < current.length; i++) next[i] = current[i];
+    if (axis === "x") next[0] = valueIsArray ? value[0] : value;
+    if (axis === "y") next[1] = valueIsArray ? value[value.length > 1 ? 1 : 0] : value;
+    return next;
+  }
+  if (currentIsArray && !valueIsArray && typeof value === "number") {
+    if (current.length >= 2) return [value, value];
+    return [value];
+  }
+  if (!currentIsArray && valueIsArray) return value[0];
+  return value;
+}
+function __secondsToTimecode(seconds, fps) {
+  fps = Number(fps);
+  if (!isFinite(fps) || fps <= 0) fps = 30;
+  var frameRate = Math.round(fps);
+  var totalFrames = Math.round(Number(seconds) * fps);
+  if (!isFinite(totalFrames) || totalFrames < 0) totalFrames = 0;
+  var f = totalFrames % frameRate;
+  var totalSeconds = Math.floor(totalFrames / frameRate);
+  var s = totalSeconds % 60;
+  var totalMinutes = Math.floor(totalSeconds / 60);
+  var m = totalMinutes % 60;
+  var h = Math.floor(totalMinutes / 60);
+  function pad(n) { return (n < 10 ? "0" : "") + String(n); }
+  return pad(h) + ":" + pad(m) + ":" + pad(s) + ":" + pad(f);
+}
+var __TICKS_PER_SECOND = 254016000000;
 function __secondsToTicks(seconds) {
-  return String(Math.round(seconds * 254016000000));
+  return String(Math.round(Number(seconds || 0) * __TICKS_PER_SECOND));
+}
+function __ticksToSeconds(ticks) {
+  if (ticks === undefined || ticks === null || ticks === "") return 0;
+  if (typeof ticks === "object") {
+    try {
+      if (typeof ticks.seconds === "number" && isFinite(ticks.seconds)) return ticks.seconds;
+    } catch (eSeconds) {}
+    try {
+      if (ticks.ticks !== undefined && ticks.ticks !== null) return __ticksToSeconds(ticks.ticks);
+    } catch (eTicks) {}
+    return 0;
+  }
+  if (typeof ticks === "number") {
+    if (!isFinite(ticks)) return 0;
+    return Math.abs(ticks) >= 1000000 ? ticks / __TICKS_PER_SECOND : ticks;
+  }
+  var parsed = parseInt(String(ticks), 10);
+  if (!isFinite(parsed)) return 0;
+  return Math.abs(parsed) >= 1000000 ? parsed / __TICKS_PER_SECOND : parsed;
+}
+function __coerceProjectItemId(value) {
+  if (value == null) return "";
+  if (typeof value === "object") {
+    return String(value.projectItemId || value.nodeId || value.id || value.clipId || value.itemId || "");
+  }
+  return String(value);
+}
+function __expandIdList(value) {
+  var out = [];
+  function pushId(id) {
+    if (id == null) return;
+    var s = String(id).replace(/^\s+|\s+$/g, "");
+    if (!s) return;
+    for (var i = 0; i < out.length; i++) if (out[i] === s) return;
+    out.push(s);
+  }
+  function looksLikeId(text) {
+    return /^[0-9a-fA-F-]+$/.test(text);
+  }
+  function walk(v) {
+    if (v == null || v === "") return;
+    if (typeof v === "string") {
+      var s = v.replace(/^\s+|\s+$/g, "");
+      if (!s) return;
+      if ((s.charAt(0) === "[" && s.charAt(s.length - 1) === "]") || (s.charAt(0) === "{" && s.charAt(s.length - 1) === "}")) {
+        try { walk(__mcpParse(s)); return; } catch (eParse) {}
+      }
+      if (s.indexOf(",") >= 0) {
+        var parts = s.split(",");
+        var allIds = parts.length > 1;
+        for (var pi = 0; pi < parts.length && allIds; pi++) {
+          var part = parts[pi].replace(/^\s+|\s+$/g, "").replace(/^"+|"+$/g, "");
+          if (part && !looksLikeId(part)) allIds = false;
+        }
+        if (allIds) {
+          for (var pj = 0; pj < parts.length; pj++) {
+            walk(parts[pj].replace(/^\s+|\s+$/g, "").replace(/^"+|"+$/g, ""));
+          }
+          return;
+        }
+      }
+      pushId(s);
+      return;
+    }
+    if (typeof v === "object") {
+      var isArr = false;
+      try { isArr = v instanceof Array; } catch (eArr) {}
+      if (!isArr) {
+        try { isArr = typeof v.length === "number" && typeof v.splice === "function"; } catch (eLen) {}
+      }
+      if (isArr) {
+        for (var ai = 0; ai < v.length; ai++) walk(v[ai]);
+        return;
+      }
+      walk(__coerceProjectItemId(v));
+    }
+  }
+  walk(value);
+  return out;
+}
+function __qeSequenceForRetry(seq) {
+  var found = __qeSequenceFor(seq);
+  if (found) return found;
+  __activateSequenceForQE(seq);
+  try { app.enableQE(); } catch (eEnable) {}
+  found = __qeSequenceLookup(seq);
+  if (found) return found;
+  try {
+    var active = qe.project.getActiveSequence();
+    if (!active || !seq) return null;
+    if (String(active.guid) === String(seq.sequenceID)) return active;
+    if (String(active.name) === String(seq.name)) return active;
+  } catch (eActive) {}
+  return null;
+}
+function __findQeNamed(kind, name) {
+  var getters = {
+    videoEffect: "getVideoEffectByName",
+    audioEffect: "getAudioEffectByName",
+    videoTransition: "getVideoTransitionByName",
+    audioTransition: "getAudioTransitionByName"
+  };
+  var lists = {
+    videoEffect: "getVideoEffectList",
+    audioEffect: "getAudioEffectList",
+    videoTransition: "getVideoTransitionList",
+    audioTransition: "getAudioTransitionList"
+  };
+  try { app.enableQE(); } catch (eEnable) { return null; }
+  if (!qe || !qe.project) return null;
+  var getter = getters[kind];
+  var listName = lists[kind];
+  if (!getter) return null;
+  var direct = null;
+  try { direct = qe.project[getter](name); } catch (eDirect) {}
+  if (direct) return direct;
+  var list = [];
+  try { list = qe.project[listName]() || []; } catch (eList) {}
+  for (var i = 0; i < list.length; i++) {
+    if (__namesMatch(list[i], name)) {
+      try {
+        var found = qe.project[getter](list[i]);
+        if (found) return found;
+      } catch (eFound) {}
+    }
+  }
+  return null;
 }
 `;
+
+/** Function names the prelude actually defines. Tests must derive the host-global allowlist from this, not a parallel handwritten list. */
+export function listPreludeHelperNames(source = EXTENDSCRIPT_HELPERS): string[] {
+  const names: string[] = [];
+  const re = /^function (__[A-Za-z0-9]+)\s*\(/gm;
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(source))) {
+    const name = match[1];
+    if (name) names.push(name);
+  }
+  return names;
+}
 
 export interface PremiereProProject {
   id: string;
@@ -526,6 +860,8 @@ export class PremiereProBridge implements PremiereProTransport {
   private uxpProcess?: ChildProcess;
   private isInitialized = false;
   private sessionId: string;
+  private premiereInstallPath: string | null = null;
+  private premiereLaunchPath: string | null = null;
 
   constructor() {
     this.logger = new Logger('PremiereProBridge');
@@ -564,8 +900,8 @@ export class PremiereProBridge implements PremiereProTransport {
     // Scan the install root instead of hardcoding release years, so new
     // versions (2025, 2026, ...) are detected without a code change.
     const searchDirs = process.platform === 'win32'
-      ? [join(process.env['ProgramFiles'] || 'C:\\Program Files', 'Adobe')]
-      : ['/Applications'];
+      ? [joinPremiereHostPath(process.env['ProgramFiles'] || 'C:\\Program Files', 'Adobe')]
+      : [joinPremiereHostPath('/Applications')];
 
     for (const dir of searchDirs) {
       let entries: string[] = [];
@@ -583,18 +919,172 @@ export class PremiereProBridge implements PremiereProTransport {
         .reverse();
 
       for (const candidate of candidates) {
-        const path = join(dir, candidate);
+        const installPath = joinPremiereHostPath(dir, candidate);
         try {
-          await fs.access(path);
-          this.logger.info(`Found Adobe Premiere Pro at: ${path}`);
+          await fs.access(installPath);
+          const launchPath = await this.findPremiereLaunchPath(installPath);
+          this.premiereInstallPath = installPath;
+          if (launchPath) this.premiereLaunchPath = launchPath;
+          this.logger.info(`Found Adobe Premiere Pro at: ${installPath}`);
           return;
-        } catch (error) {
+        } catch {
           // Continue checking other candidates
         }
       }
     }
 
     this.logger.warn('Adobe Premiere Pro installation not found in common paths');
+  }
+
+  private async findPremiereLaunchPath(installPath: string): Promise<string | null> {
+    if (process.platform === 'darwin') {
+      try {
+        const listing = await fs.readdir(installPath);
+        const app = listing.find((entry) => entry.endsWith('.app'));
+        if (app) return joinPremiereHostPath(installPath, app);
+      } catch {
+        return installPath;
+      }
+      return installPath;
+    }
+    if (process.platform === 'win32') {
+      const exe = joinPremiereHostPath(installPath, 'Adobe Premiere Pro.exe');
+      try {
+        await fs.access(exe);
+        return exe;
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  }
+
+  async ensureHost(options: EnsureHostOptions = {}): Promise<EnsureHostResult> {
+    const launchIfNeeded = options.launchIfNeeded !== false;
+    const waitMs = options.waitMs ?? PREMIERE_LAUNCH_WAIT_MS;
+    const tool = 'verify_premiere_connection';
+
+    if (!this.isInitialized) {
+      await this.initialize();
+    }
+
+    const beat = await this.readHeartbeat();
+    if (beat?.started) {
+      return { ready: true, success: true, status: 'connected' };
+    }
+    if (beat && !beat.started) {
+      return {
+        ready: false,
+        success: false,
+        status: 'bridge_not_started',
+        retry: false,
+        userActionRequired: true,
+        agentAction: 'verify_premiere_connection',
+        nextStep: BRIDGE_NOT_STARTED,
+        error: BRIDGE_NOT_STARTED,
+        tool,
+      };
+    }
+
+    const running = await this.isPremiereProcessRunning();
+    let launched = false;
+    if (!running && launchIfNeeded && this.premiereLaunchPath) {
+      launched = this.launchPremiere();
+    }
+
+    if (!running && !launched) {
+      const nextStep = this.premiereInstallPath
+        ? 'Adobe Premiere Pro is installed but could not be launched from this environment. Open Premiere yourself. The MCP Bridge panel auto-starts. Then run verify_premiere_connection once.'
+        : 'Adobe Premiere Pro is not installed in the usual location, so this server cannot launch it. Open Premiere, choose Window > Extensions > MCP Bridge if the panel does not appear, and run verify_premiere_connection once.';
+      return {
+        ready: false,
+        success: false,
+        status: 'premiere_not_running',
+        retry: false,
+        userActionRequired: true,
+        agentAction: 'tell_user',
+        nextStep,
+        error: nextStep,
+        tool,
+        ...(this.premiereInstallPath ? { installPath: this.premiereInstallPath } : {}),
+      };
+    }
+
+    const connected = await this.waitForStartedHeartbeat(waitMs);
+    if (connected) {
+      return {
+        ready: true,
+        success: true,
+        status: 'connected',
+        launched,
+        premiereRunning: true,
+        ...(this.premiereInstallPath ? { installPath: this.premiereInstallPath } : {}),
+      };
+    }
+
+    const nextStep = launched
+      ? 'Premiere was launched but the MCP Bridge panel did not connect in time. When Premiere finishes opening, confirm Window > Extensions > MCP Bridge is visible, then run verify_premiere_connection once. Do not retry other tools yet.'
+      : BRIDGE_PANEL_NOT_RUNNING;
+    return {
+      ready: false,
+      success: false,
+      status: 'bridge_unavailable',
+      launched,
+      premiereRunning: true,
+      retry: false,
+      userActionRequired: true,
+      agentAction: 'tell_user',
+      nextStep,
+      error: nextStep,
+      tool,
+      ...(this.premiereInstallPath ? { installPath: this.premiereInstallPath } : {}),
+    };
+  }
+
+  private async isPremiereProcessRunning(): Promise<boolean> {
+    try {
+      if (process.platform === 'darwin') {
+        await execFileAsync('pgrep', ['-f', 'Adobe Premiere Pro'], { timeout: 3000 });
+        return true;
+      }
+      if (process.platform === 'win32') {
+        const { stdout } = await execFileAsync(
+          'tasklist',
+          ['/FI', 'IMAGENAME eq Adobe Premiere Pro.exe'],
+          { timeout: 5000 },
+        );
+        return /Adobe Premiere Pro\.exe/i.test(stdout);
+      }
+    } catch {
+      return false;
+    }
+    return false;
+  }
+
+  private launchPremiere(): boolean {
+    if (!this.premiereLaunchPath) return false;
+    try {
+      const child =
+        process.platform === 'darwin'
+          ? spawn('open', ['-a', this.premiereLaunchPath], { detached: true, stdio: 'ignore' })
+          : spawn(this.premiereLaunchPath, [], { detached: true, stdio: 'ignore', windowsHide: false });
+      child.unref();
+      this.logger.info(`Launched Adobe Premiere Pro from ${this.premiereLaunchPath}`);
+      return true;
+    } catch (error) {
+      this.logger.warn(`Failed to launch Adobe Premiere Pro: ${error instanceof Error ? error.message : String(error)}`);
+      return false;
+    }
+  }
+
+  private async waitForStartedHeartbeat(waitMs: number): Promise<boolean> {
+    const deadline = Date.now() + waitMs;
+    while (Date.now() < deadline) {
+      const beat = await this.readHeartbeat();
+      if (beat?.started) return true;
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+    return false;
   }
 
   private async initializeCommunication(): Promise<void> {

@@ -9,6 +9,7 @@ import { promises as fs } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PremiereProTools, evaluateTextInjectionResult } from '../../tools/index.js';
+import * as discovery from '../../tools/domains/discovery.js';
 import { PremiereProBridge } from '../../bridge/index.js';
 import { executeExpandedTool, expandedToolNames, unimplementedExpandedToolNames } from '../../tools/expanded.js';
 
@@ -81,6 +82,9 @@ describe('PremiereProTools', () => {
       expect(toolNames).toContain('capture_frame');
       expect(toolNames).toContain('add_tracks');
       expect(toolNames).toContain('get_encoder_presets');
+      expect(toolNames).toContain('search_tools');
+      expect(toolNames).toContain('get_tool_schema');
+      expect(toolNames).toContain('invoke_tool');
       expect(toolNames).not.toContain('import_ae_comps');
       expect(availableTools).toHaveLength(283);
       expect(unimplementedExpandedToolNames).toEqual([]);
@@ -457,7 +461,7 @@ describe('PremiereProTools', () => {
           sequenceId: 'seq-guid', time: 15, outputPath: '/tmp/f.png',
         });
 
-        expect(script).toContain('var qeSequence = __qeSequenceFor(sequence);');
+        expect(script).toContain('var qeSequence = __qeSequenceForRetry(sequence);');
         // Match the assignment, not the bare call: the surrounding comment
         // names getActiveSequence() to explain what it replaced.
         expect(script).not.toContain('var qeSequence = qe.project.getActiveSequence()');
@@ -578,14 +582,29 @@ describe('PremiereProTools', () => {
     });
 
     it('reports local capabilities without probing the Premiere bridge by default', async () => {
-      const result = await tools.executeTool('get_capabilities', {});
+      const previous = process.env.PREMIERE_MCP_TOOLSET;
+      delete process.env.PREMIERE_MCP_TOOLSET;
+      try {
+        const result = await tools.executeTool('get_capabilities', {});
 
-      expect(result.success).toBe(true);
-      expect(result.catalog).toEqual({ tools: 283, resources: 13, prompts: 10 });
-      expect(result.liveConnection.checked).toBe(false);
-      expect(result.update.current).toBeTruthy();
-      expect(result.update.available).toBe(false);
-      expect(mockBridge.executeScript).not.toHaveBeenCalled();
+        expect(result.success).toBe(true);
+        expect(result.catalog).toEqual({
+          tools: 283,
+          advertised: 5,
+          toolset: 'search',
+          search: 'search_tools',
+          invoke: 'invoke_tool',
+          resources: 13,
+          prompts: 10,
+        });
+        expect(result.liveConnection.checked).toBe(false);
+        expect(result.update.current).toBeTruthy();
+        expect(result.update.available).toBe(false);
+        expect(mockBridge.executeScript).not.toHaveBeenCalled();
+      } finally {
+        if (previous === undefined) delete process.env.PREMIERE_MCP_TOOLSET;
+        else process.env.PREMIERE_MCP_TOOLSET = previous;
+      }
     });
 
     it('can include an explicit read-only live connection check in capabilities', async () => {
@@ -631,7 +650,9 @@ describe('PremiereProTools', () => {
 
       expect(result.success).toBe(false);
       expect(result.retry).toBe(false);
-      expect(result.nextStep).toMatch(/Start Bridge/);
+      expect(result.userActionRequired).toBe(true);
+      expect(result.agentAction).toBe('verify_premiere_connection');
+      expect(result.nextStep).toMatch(/verify_premiere_connection/);
     });
 
     it('executes expanded tools through our bridge dispatcher', async () => {
@@ -686,7 +707,7 @@ describe('PremiereProTools', () => {
       expect(mockBridge.executeScript).toHaveBeenCalled();
     });
 
-    it('keeps the expanded dispatcher fail-closed for missing handlers and placeholder reads', async () => {
+    it('keeps the expanded dispatcher fail-closed for missing handlers and defaults capture_frame output', async () => {
       mockBridge.executeScript.mockResolvedValue({ success: false, error: 'not executed in unit test' });
 
       await executeExpandedTool(mockBridge, 'ripple_delete', { clipId: 'clip-123' });
@@ -695,9 +716,9 @@ describe('PremiereProTools', () => {
       expect(missingHandlerScript).not.toContain('accepted: true');
 
       await executeExpandedTool(mockBridge, 'capture_frame', {});
-      const placeholderReadScript = mockBridge.executeScript.mock.calls[1][0];
-      expect(placeholderReadScript).toContain('not implemented with a verifiable Premiere DOM readback yet');
-      expect(placeholderReadScript).not.toContain('Read operation completed');
+      const captureScript = mockBridge.executeScript.mock.calls[1][0] as string;
+      expect(captureScript).toContain('__qeSequenceForRetry');
+      expect(captureScript).toContain('premiere-mcp-frame-');
     });
 
     it('creates a sequence from a single projectItemId or a timeline clip id', async () => {
@@ -705,7 +726,8 @@ describe('PremiereProTools', () => {
 
       await executeExpandedTool(mockBridge, 'create_sequence_from_clips', { projectItemId: 'item-1', name: 'Cut' });
       const script = mockBridge.executeScript.mock.calls[0][0] as string;
-      expect(script).toContain('if (!clipItemIds.length && args.projectItemId) clipItemIds = [args.projectItemId]');
+      expect(script).toContain('mergeIds(args.projectItemId)');
+      expect(script).toContain('__expandIdList');
       expect(script).toContain('asTimelineClip.clip.projectItem');
       expect(script).toContain('findClipAnywhere(wantedId)');
       expect(script).toContain('findParentItem(clipItems[0])');
@@ -1337,7 +1359,8 @@ describe('PremiereProTools', () => {
       expect(script).toContain('Premiere accepted setValue but the resulting value could not be read back');
       expect(script).toContain('if (!valuesEquivalent(actual[vai], requested[vai]))');
       expect(script).toContain('warnings: paramWarnings');
-      expect(script).toContain('if (!paramResults[pr].ok)');
+      expect(script).toContain('if (__namesMatch(newComp.properties[k].displayName, pName))');
+      expect(script).toContain('__coercePropertyValue');
     });
 
     it('returns an explicit unsupported result for caption track deletion', async () => {
@@ -1375,7 +1398,7 @@ describe('PremiereProTools', () => {
       expect(result.effectName).toBe('Crop');
       expect(mockBridge.executeScript).toHaveBeenCalledTimes(1);
       const script = mockBridge.executeScript.mock.calls[0][0];
-      expect(script).toContain('getVideoEffectByName("Crop")');
+      expect(script).toContain('__findQeNamed("videoEffect", "Crop")');
       expect(script).toContain('findQeClipByTime');
       expect(script).toContain('"Left":12');
       expect(script).toContain('"Bottom":25');
@@ -1412,8 +1435,9 @@ describe('PremiereProTools', () => {
 
       expect(result.success).toBe(true);
       const script = mockBridge.executeScript.mock.calls[0][0];
-      expect(script).not.toContain('clip.outPoint = timeFromSeconds(targetOutPoint)');
       expect(script).toContain('clip.end = timeFromSeconds(secondsOf(clip.start) + targetDuration)');
+      expect(script).toContain('if (closeEnough(durationAfterEnd.duration, targetDuration))');
+      expect(script).toContain('clip.outPoint = timeFromSeconds(targetOutPoint)');
       expect(script).not.toContain('new Time(clip.inPoint.seconds + 2.5)');
       expect(script).toContain('timeline duration did not change to requested value');
       expect(script).toContain('TRIM_UNSUPPORTED_FOR_CLIP');
@@ -1624,10 +1648,12 @@ describe('PremiereProTools', () => {
       const script = mockBridge.executeScript.mock.calls[0][0];
       expect(script).toContain('var info2 = __findClip("clip-2")');
       expect(script).toContain('qeClip.addTransition(transition, info2 ? false : true, String(frames), "0"');
+      expect(script).toContain(', 0.5, true, true)');
       expect(script).not.toContain('frames + ":00"');
       expect(script).toContain('__transitionWasVerified(before, after)');
       expect(script).toContain('__transitionWasVerifiedByXml(beforeXml, afterXml)');
-      expect(script).toContain('Transition call completed but Premiere Pro did not expose a verified transition change');
+      expect(script).toContain('accepted_unverified');
+      expect(script).not.toContain('Transition call completed but Premiere Pro did not expose a verified transition change');
     });
 
     it('distinguishes verified, accepted-unverified, and failed add_transition_to_clip results', async () => {
@@ -1664,8 +1690,8 @@ describe('PremiereProTools', () => {
       expect(script).toContain('status: "failed"');
       expect(script).not.toContain('applied: true');
       expect(script).not.toContain('Transition call completed but Premiere Pro did not expose a verified transition change');
-      expect(script).toContain('new Date().getTime()');
-      expect(script).not.toContain('Date.now()');
+      expect(script).toContain('Skipped: FCP XML export opens Translation Results dialogs');
+      expect(script).not.toContain('seq.exportAsFinalCutProXML(file.fsName)');
 
       const tool = tools.getAvailableTools().find((candidate) => candidate.name === 'add_transition_to_clip');
       expect(tool?.description).toContain('do not retry automatically');
@@ -1751,7 +1777,7 @@ describe('PremiereProTools', () => {
       expect(mockBridge.executeScript.mock.calls[0][0]).toContain('__normalizeSpeedRatio(150)');
     });
 
-    it('matches add_keyframe component and parameter names without regard to case', async () => {
+    it('matches add_keyframe component and parameter names through locale aliases', async () => {
       mockBridge.executeScript.mockResolvedValue({ success: true });
 
       await tools.executeTool('add_keyframe', {
@@ -1763,9 +1789,25 @@ describe('PremiereProTools', () => {
       });
 
       const script = mockBridge.executeScript.mock.calls[0][0] as string;
-      expect(script).toContain('replace(/[\\s_-]+/g, "")');
+      expect(script).toContain('__resolveClipProperty');
       expect(script).toContain('"motion"');
       expect(script).toContain('"scale"');
+    });
+
+    it('accepts a Position array as add_keyframe value', async () => {
+      mockBridge.executeScript.mockResolvedValue({ success: true });
+
+      const result = await tools.executeTool('add_keyframe', {
+        clipId: 'clip-1',
+        componentName: 'Motion',
+        paramName: 'Position',
+        time: 1,
+        value: [0.4, 0.6],
+      });
+
+      expect(result.success).not.toBe(false);
+      const script = mockBridge.executeScript.mock.calls[0][0] as string;
+      expect(script).toContain('[0.4,0.6]');
     });
 
     it('fails batch_add_transitions when no transition is verifiably added', async () => {
@@ -1812,95 +1854,6 @@ describe('PremiereProTools', () => {
       expect(result.success).toBe(true);
       expect(mockBridge.executeScript).toHaveBeenCalledWith(expect.stringContaining('__findClip("clip-123", "seq-456")'));
       expect(mockBridge.executeScript).toHaveBeenCalledWith(expect.stringContaining('var isRipple = "lift" === "ripple";'));
-    });
-
-    describe('move_clip', () => {
-      it('performs a same-track time-only move when newTrackIndex is omitted', async () => {
-        mockBridge.executeScript.mockResolvedValue({
-          success: true,
-          trackChanged: false,
-          newTrackIndex: 0,
-        });
-
-        const result = await tools.executeTool('move_clip', {
-          clipId: 'clip-123',
-          newTime: 5.5,
-        });
-
-        expect(result.success).toBe(true);
-        expect(result.trackChanged).toBe(false);
-
-        const script = mockBridge.executeScript.mock.calls[0][0];
-        // Track is unspecified → requestedTrack null → original clip.move() path.
-        expect(script).toContain('var requestedTrack = null;');
-        expect(script).toContain('clip.move(5.5 - oldTime);');
-        // clipId is JSON-encoded, not raw-interpolated.
-        expect(script).toContain('__findClip("clip-123")');
-      });
-
-      it('treats newTrackIndex equal to the current track as a time-only move at runtime', async () => {
-        mockBridge.executeScript.mockResolvedValue({ success: true, trackChanged: false });
-
-        await tools.executeTool('move_clip', {
-          clipId: 'clip-123',
-          newTime: 2,
-          newTrackIndex: 3,
-        });
-
-        const script = mockBridge.executeScript.mock.calls[0][0];
-        // The same-track short-circuit is decided in ExtendScript (requestedTrack === srcTrackIndex).
-        expect(script).toContain('var requestedTrack = 3;');
-        expect(script).toContain('requestedTrack === srcTrackIndex');
-      });
-
-      it('generates a cross-track relocation that preserves in/out and guards occupancy', async () => {
-        mockBridge.executeScript.mockResolvedValue({
-          success: true,
-          trackChanged: true,
-          newTrackIndex: 1,
-          duration: 2.377,
-        });
-
-        const result = await tools.executeTool('move_clip', {
-          clipId: 'clip-abc',
-          newTime: 1.5,
-          newTrackIndex: 1,
-        });
-
-        expect(result.success).toBe(true);
-        expect(result.trackChanged).toBe(true);
-        expect(result.newTrackIndex).toBe(1);
-
-        const script = mockBridge.executeScript.mock.calls[0][0];
-        expect(script).toContain('var requestedTrack = 1;');
-        // Occupancy guard — must refuse to overwrite, not silently clobber.
-        expect(script).toContain('Destination span');
-        expect(script).toContain('refusing to overwrite');
-        // Re-place on target track and restore the exact trimmed in/out.
-        expect(script).toContain('targetTrack.overwriteClip(pItem, tempTime);');
-        expect(script).toContain('placed.inPoint = new Time(srcIn + "s");');
-        expect(script).toContain('placed.outPoint = new Time(srcOut + "s");');
-        // Original is lifted (ripple=false) so the source track keeps its timing.
-        expect(script).toContain('clip.remove(false, false);');
-      });
-
-      it('surfaces an occupied-destination failure from the bridge instead of claiming success', async () => {
-        mockBridge.executeScript.mockResolvedValue({
-          success: false,
-          error: 'Destination span on track 1 is occupied; refusing to overwrite. Clear the destination or choose another time/track.',
-          occupiedBy: 'OSP_DX_0001.tif',
-        });
-
-        const result = await tools.executeTool('move_clip', {
-          clipId: 'clip-abc',
-          newTime: 1.5,
-          newTrackIndex: 1,
-        });
-
-        expect(result.success).toBe(false);
-        expect(result.error).toContain('occupied');
-        expect(result.occupiedBy).toBe('OSP_DX_0001.tif');
-      });
     });
   });
 
@@ -2445,8 +2398,7 @@ describe('PremiereProTools', () => {
 
     it('resolves a unique presetName exactly and rejects ambiguous names', async () => {
       const { presetPath, outputPath } = await createTempPreset('Named Preset');
-      const toolsAny = tools as any;
-      jest.spyOn(toolsAny, 'getEncoderPresets').mockResolvedValue({
+      const presets = jest.spyOn(discovery, 'getEncoderPresets').mockResolvedValue({
         success: true,
         presets: [
           { name: 'Named Preset', path: presetPath, source: 'user', ameVersion: '26.0' },
@@ -2467,7 +2419,7 @@ describe('PremiereProTools', () => {
       expect(result.success).toBe(true);
       expect(result.presetPath).toBe(presetPath);
 
-      toolsAny.getEncoderPresets.mockResolvedValue({
+      presets.mockResolvedValue({
         success: true,
         presets: [
           { name: 'Duplicate', path: presetPath, source: 'user', ameVersion: '26.0' },

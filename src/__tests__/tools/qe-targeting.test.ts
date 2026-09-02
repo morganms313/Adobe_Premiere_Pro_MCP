@@ -24,7 +24,7 @@ describe('QE targeting, second pass', () => {
   /**
    * The block for one tool inside the shared script.
    *
-   * All 171 expanded tools emit the same ~123 KB body, differing only in the tool
+   * All 168 expanded tools emit the same ~123 KB body, differing only in the tool
    * name near the top, so asserting `toContain` against the whole script says
    * nothing about the tool under test: `sequenceRequestError()` appears in it 39
    * times no matter which tool asked. Every case below therefore passed while the
@@ -113,7 +113,9 @@ describe('QE targeting, second pass', () => {
       // name to explain what replaced it, and a naive count picks those up.
       const code = script.split('\n').filter((l) => !l.trim().startsWith('//')).join('\n');
       const total = (code.match(/qe\.project\.getActiveSequence\(\)/g) || []).length;
-      expect(total).toBe(1);
+      // One read before activate, one after openSequence/activeSequence assignment.
+      // Both must still guid-check so this never becomes "use whatever is on screen".
+      expect(total).toBe(2);
       expect(inFallback).toContain('String(activeCandidate.guid) === String(seq.sequenceID)');
     });
   });
@@ -155,27 +157,7 @@ describe('QE targeting, second pass', () => {
   });
 
   describe('move_clip', () => {
-    /**
-     * DELIBERATE DIVERGENCE FROM UPSTREAM.
-     *
-     * Upstream dropped newTrackIndex from move_clip and made the schema .strict(),
-     * so passing it is an error; cross-track moves go to move_clip_to_track in
-     * expanded.ts. This fork keeps the option, because that replacement calls
-     * overwriteClip with the *projectItem*: it applies the item's default duration
-     * (for a still, longer than the trimmed clip) and overwrites whatever occupies
-     * the destination. Our path reads the source in/out first, parks the clip on
-     * empty space, restores the exact trim, and refuses an occupied destination.
-     * The behavioural contract is covered in index.test.ts > move_clip.
-     *
-     * Upstream's instinct was still right about the failure mode it feared: a
-     * caller passes newTrackIndex, gets success, and the clip never moves. That is
-     * what this test guards, one layer lower than a schema check. Merging upstream
-     * v1.2.4 reintroduced exactly that bug — the dispatch line auto-merged to the
-     * two-argument form while the schema and the ExtendScript both still honoured
-     * a third, so the argument was accepted and then dropped in transit, with no
-     * conflict raised. Confirmed to fail when that argument is removed again.
-     */
-    it('threads newTrackIndex through dispatch into the generated script', async () => {
+    it('rejects a leftover newTrackIndex instead of dropping it', async () => {
       const bridge = { executeScript: jest.fn().mockResolvedValue({ success: true }) };
       const tools = new PremiereProTools(bridge as any);
 
@@ -183,14 +165,8 @@ describe('QE targeting, second pass', () => {
         clipId: 'c', newTime: 1, newTrackIndex: 3,
       });
 
-      expect(result.success).toBe(true);
-      expect(bridge.executeScript).toHaveBeenCalled();
-
-      // The requested track must reach ExtendScript as a value, not as null:
-      // null is the time-only path, which is what a dropped argument degrades to.
-      const script = bridge.executeScript.mock.calls[0][0] as string;
-      expect(script).toContain('var requestedTrack = 3;');
-      expect(script).not.toContain('var requestedTrack = null;');
+      expect(result.success).toBe(false);
+      expect(bridge.executeScript).not.toHaveBeenCalled();
     });
   });
 

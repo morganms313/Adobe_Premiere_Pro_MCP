@@ -4,6 +4,87 @@ All notable changes are documented here. Releases use semantic versioning.
 
 ## [Unreleased]
 
+## [1.2.8] - 2026-09-02
+
+- `move_clip_to_track` parks past the last clip on the destination, restores
+  source in/out and timeline `end`, slides into the occupancy-checked span, then
+  lifts the source. The 1.2.6 fallback called `overwriteClip` at the destination
+  using the project item's own duration, so a trimmed still could take out a
+  neighbour the guard never saw. Failures leave the source clip in place.
+- The CEP update banner copies
+  `npm install -g adobe-premiere-pro-mcp@latest && premiere-pro-mcp --install-cep`
+  instead of spawning npm from Premiere. Adobe's CEP PATH preferred
+  `/usr/local/bin/npm`, which then failed with EACCES writing `/usr/local`.
+- `--install-cep` copies over the live extension instead of `rm -rf`.
+- Removed the GitHub Actions `Publish npm package` workflow. The repo `NPM_TOKEN`
+  cannot publish `adobe-premiere-pro-mcp`; releases go up with a local
+  `npm publish` after `npm login`.
+
+## [1.2.7] - 2026-08-31
+
+- Premiere 26 QE cannot enumerate sequences (`getSequenceAt` throws; `openInTimeline` is missing). `__qeSequenceFor` now activates the requested sequence via `openSequence` / `activeSequence` so QE tools address that timeline, not whatever is on screen.
+- `set_sequence_field_type` writes numeric field type `0` / `1` / `2` instead of the string `"No Fields"`.
+- `set_metadata` no longer coerces `value` to a number when a metadata `key` is present.
+- Expanded tools that need a clip or project item now require `clipId` / `projectItemId` in the schema.
+- `add_transition` matches `add_transition_to_clip` (`applied_verified` / `accepted_unverified`). Transition verification no longer exports FCP XML, which opened Translation Results dialogs.
+- `apply_audio_effect` rejects video-only clips with `clip_has_no_audio`.
+- `import_fcp_xml` warns that Premiere may still show Translation Results windows.
+- Removed `remove_effect`, `remove_effect_by_name`, and `remove_all_effects`. Premiere 26 has no effect-removal API. Catalog is 283 tools.
+
+## [1.2.6] - 2026-08-31
+
+- Prelude now defines `__ticksToSeconds` / `__secondsToTicks` (and accepts Premiere
+  `Time` objects, not just tick strings). `list_sequences`, `get_active_sequence`,
+  `set_playhead_position`, `create_sequence`, work area, MOGRT import, and subclip
+  tools no longer throw `ReferenceError` on a Connected panel. Tests derive the
+  host-global allowlist from the prelude so a missing helper cannot ship again.
+- `replace_clip` honors `preserveEffects` (default true): restore source in/out,
+  enabled, Motion, and re-apply other effects. It no longer reports success after
+  dropping Scale/enabled/trim.
+- `move_clip_to_track` restores source in/out, skips the source clip in occupancy
+  checks, refuses an occupied destination unless `overwrite` is true, and places
+  onto the destination track only (no longer `sequence.overwriteClip` onto A1).
+- `trim_clip` duration writes `clip.end` and, only after that duration actually
+  applies, syncs source `outPoint`. Unsupported graphic extensions still leave
+  `outPoint` untouched.
+- `create_sequence_from_clips` parses JSON-encoded id arrays (`["000f4241"]`) and
+  comma-separated hex ids. The import helper `createSequenceFromProjectItems`
+  uses `__resolveProjectItem` / `__idsMatch`.
+- `apply_effect` matches parameter names with locale aliases (`Exposure` /
+  `Exposition`) and coerces values before `setValue`. Effect removal tries
+  `components.remove` and QE named-remove APIs, then verifies the component is gone.
+- The CEP panel auto-starts the bridge when it loads. `verify_premiere_connection`
+  launches Premiere when it is installed and the heartbeat is missing, then waits
+  for the panel. MCP `instructions` tell the agent to call that once and stop
+  with `userActionRequired` instead of spraying tools at a closed Premiere.
+  Launch paths are joined with posix/win32 keyed off `process.platform`, so a
+  darwin stub on Windows CI no longer feeds backslashes to `open -a`.
+- Tool search (Anthropic-style BM25 + regex): `tools/list` advertises
+  `search_tools`, `get_tool_schema`, `invoke_tool`, `verify_premiere_connection`,
+  and `list_sequences` by default. The other 280+ Premiere tools stay in the
+  catalog and run through `invoke_tool`. Empty `search_tools` lists categories.
+  Set `PREMIERE_MCP_TOOLSET=full` to restore a flat list for hosts that natively
+  defer MCP schemas. Unknown-tool errors no longer dump every tool name.
+
+## [1.2.5] - 2026-08-30
+
+- Clip, effect, and transition names now match localized Premiere labels
+  (Motion/Movimento, Scale/Escala, Volume/Lautstärke, Gaussian Blur/Flou
+  gaussien, Cross Dissolve, Crop, and the same family of aliases). 1.2.4 only
+  compared case.
+- `add_keyframe`, `set_clip_properties`, `adjust_audio_levels`, and the
+  expanded property helpers resolve Opacity on Motion, Position X/Y as the
+  Position array plus an axis, and refuse to pass arrays into scalar Scale.
+- `__findSequence` accepts a GUID, sequence name, or hex `projectItem.nodeId`
+  (`000f4344`). `__resolveProjectItem` also accepts a timeline clip id and
+  returns `clip.projectItem`. 1.2.4's hex/decimal `__idsMatch` only equated
+  two forms of the same object.
+- `export_frame` converts seconds to `HH:MM:SS:FF` first and retries QE after
+  opening the sequence. `apply_effect` reuses a component that is already
+  present. Transitions settle ~150ms then resolve by localized name.
+- `capture_frame` writes to `tmpdir()/premiere-mcp-frame-*.png` when the
+  agent omits `outputPath`.
+
 ## [1.2.4] - 2026-08-28
 
 - `speed_change` and `set_clip_speed_qe` now call QE `setSpeed` with its real
