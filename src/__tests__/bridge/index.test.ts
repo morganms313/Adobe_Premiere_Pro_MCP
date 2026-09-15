@@ -177,7 +177,7 @@ describe('PremiereProBridge', () => {
     mockFs.unlink.mockResolvedValue(undefined);
     mockFs.readdir.mockImplementation((async (dir: string) => {
       if (dir === '/Applications') return ['Adobe Media Encoder 2026', 'Adobe Premiere Pro 2026'];
-      if (dir === '/Applications/Adobe Media Encoder 2026') return ['Adobe Media Encoder 2026.app', 'Uninstall'];
+      if (dir === path.join('/Applications', 'Adobe Media Encoder 2026')) return ['Adobe Media Encoder 2026.app', 'Uninstall'];
       return [];
     }) as any);
 
