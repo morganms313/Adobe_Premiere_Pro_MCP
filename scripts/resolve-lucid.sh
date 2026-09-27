@@ -9,20 +9,31 @@
 # Requirements: macOS, LucidLink app installed/running, the target filespace
 # mounted, and the item synced/available. Works headless from a shell/agent.
 #
-# Usage:   scripts/resolve-lucid.sh "lucid://filespace/file/ID/Name"
+# Usage:   scripts/resolve-lucid.sh [--keep-window] "lucid://filespace/file/ID/Name"
 # Output:  the resolved /Volumes/... path on stdout (exit 0), or an error.
+#
+# The Finder window the reveal opens is closed again once the path is read (only
+# windows that did not exist before the call). --keep-window leaves it open.
+# Leftovers from older runs: scripts/close-lucid-finder-windows.sh
 
 set -euo pipefail
 
+keep_window=0
+if [[ "${1:-}" == "--keep-window" ]]; then keep_window=1; shift; fi
+
 url="${1:-}"
 if [[ -z "$url" ]]; then
-  echo "usage: $0 'lucid://...'" >&2
+  echo "usage: $0 [--keep-window] 'lucid://...'" >&2
   exit 2
 fi
 if [[ "$url" != lucid://* ]]; then
   echo "error: not a lucid:// URL: $url" >&2
   exit 2
 fi
+
+# Snapshot the Finder windows that already exist, so we only ever close the one(s)
+# this reveal opens -- never a window Morgan had open himself.
+before="$(osascript -e 'tell application "Finder" to get id of every Finder window' 2>/dev/null || true)"
 
 # Hand off to LucidLink (reveals the item in Finder).
 open "$url"
@@ -48,9 +59,30 @@ for _ in 1 2 3 4 5 6 7 8 9 10; do
   /bin/sleep 0.5
 done
 
+# Close the Finder window(s) the reveal opened (ids not in the pre-open snapshot).
+# Runs on failure too, so a miss doesn't leave a window behind either.
+close_new_windows() {
+  [[ "$keep_window" == 1 ]] && return 0
+  osascript - "$before" >/dev/null 2>&1 <<'OSA' || true
+on run argv
+  set beforeIds to item 1 of argv
+  tell application "Finder"
+    -- index backwards: `every Finder window` also enumerates tabs/hidden browsers
+    repeat with i from (count of Finder windows) to 1 by -1
+      set w to Finder window i
+      set wid to (id of w) as text
+      if (", " & beforeIds & ", ") does not contain (", " & wid & ", ") then close w
+    end repeat
+  end tell
+end run
+OSA
+}
+
 if [[ -z "$path" ]]; then
+  close_new_windows
   echo "error: Finder did not surface the item (not synced, or app not running?)" >&2
   exit 1
 fi
 
+close_new_windows
 printf '%s\n' "$path"
