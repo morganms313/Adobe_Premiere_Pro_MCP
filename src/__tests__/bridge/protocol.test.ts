@@ -204,5 +204,102 @@ describe('bridge file-queue protocol', () => {
       await expect(bridge.executeScript('return 1;', 700)).rejects.toThrow(/timeout/i);
       expect(Date.now() - started).toBeGreaterThanOrEqual(700);
     });
+
+    // While Premiere runs a long evalScript (encodeSequence handing a job to AME on
+    // a network mount), the panel stops writing heartbeats. Reading that as "not
+    // running" made export_sequence report failure for jobs AME went on to render,
+    // and re-sending them produced _1 duplicates.
+    it('keeps waiting when the heartbeat goes stale mid-command, and returns the response', async () => {
+      const sentAt = Date.now();
+      mockFs.readFile.mockImplementation(async (file) => {
+        const elapsed = Date.now() - sentAt;
+        if (String(file) === heartbeatPath) {
+          // Fresh at the first check, then frozen: the host is busy, not gone.
+          return JSON.stringify({ t: sentAt, started: true });
+        }
+        if (String(file) === responsePath && elapsed >= 4500) {
+          return JSON.stringify({ result: { success: true, jobID: 'ame-1' } });
+        }
+        throw new Error('ENOENT');
+      });
+      const bridge = await readyBridge();
+
+      await expect(bridge.executeScript('return 1;', 20000)).resolves.toEqual({
+        success: true,
+        jobID: 'ame-1',
+      });
+      expect(Date.now() - sentAt).toBeGreaterThanOrEqual(4500);
+    }, 10000);
+
+    it('still fails fast when the panel was never alive while the command waited', async () => {
+      // A heartbeat left behind by a panel that stopped long ago must not count.
+      mockFs.readFile.mockImplementation(async (file) => {
+        if (String(file) === heartbeatPath) {
+          return JSON.stringify({ t: Date.now() - 60000, started: true });
+        }
+        throw new Error('ENOENT');
+      });
+      const bridge = await readyBridge();
+      const started = Date.now();
+
+      await expect(bridge.executeScript('return 1;', 20000)).rejects.toThrow(
+        /MCP Bridge is not running/,
+      );
+      expect(Date.now() - started).toBeLessThan(5000);
+    });
+
+    it('does not fail a command queued behind one the busy panel is still running', async () => {
+      // The panel runs one evalScript at a time. A second call sent while the first
+      // has frozen the heartbeat is waiting its turn, not talking to a dead panel.
+      const t0 = Date.now();
+      const firstResponse = path.join(dir, 'response-first.json');
+      const secondResponse = path.join(dir, 'response-second.json');
+      mockFs.readFile.mockImplementation(async (file) => {
+        const elapsed = Date.now() - t0;
+        if (String(file) === heartbeatPath) {
+          // Alive until the first command starts blocking the host at ~1s, then
+          // frozen until it returns at 5s, then alive again.
+          const t = elapsed < 5000 ? t0 : Date.now();
+          return JSON.stringify({ t, started: true });
+        }
+        if (String(file) === firstResponse && elapsed >= 5000) {
+          return JSON.stringify({ result: 'first-done' });
+        }
+        if (String(file) === secondResponse && elapsed >= 6000) {
+          return JSON.stringify({ result: 'second-done' });
+        }
+        throw new Error('ENOENT');
+      });
+      const bridge = await readyBridge();
+      const { randomUUID } = jest.requireMock('node:crypto') as { randomUUID: jest.Mock };
+      randomUUID.mockReturnValueOnce('first').mockReturnValueOnce('second');
+
+      const first = bridge.executeScript('return 1;', 20000);
+      first.catch(() => {}); // asserted below; keep an early rejection from crashing the run
+      // Sent after the heartbeat is already stale, so it never sees a fresh one
+      // before its own first check.
+      await new Promise((resolve) => setTimeout(resolve, 3000));
+      const second = bridge.executeScript('return 2;', 20000);
+      second.catch(() => {});
+
+      await expect(first).resolves.toBe('first-done');
+      await expect(second).resolves.toBe('second-done');
+    }, 15000);
+
+    it('warns that the command may have run when a live panel never answers', async () => {
+      // Once the panel was seen alive, a timeout no longer means "not connected":
+      // the command may have executed, and blindly re-sending duplicates it.
+      mockFs.readFile.mockImplementation(async (file) => {
+        if (String(file) === heartbeatPath) {
+          return JSON.stringify({ t: Date.now(), started: true });
+        }
+        throw new Error('ENOENT');
+      });
+      const bridge = await readyBridge();
+
+      await expect(bridge.executeScript('return 1;', 2000)).rejects.toThrow(
+        /may still be running or may already have completed/,
+      );
+    });
   });
 });

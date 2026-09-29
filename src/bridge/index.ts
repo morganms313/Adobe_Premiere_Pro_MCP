@@ -862,6 +862,15 @@ export class PremiereProBridge implements PremiereProTransport {
   private sessionId: string;
   private premiereInstallPath: string | null = null;
   private premiereLaunchPath: string | null = null;
+  // Commands whose wait has seen the panel alive and that are still outstanding.
+  // The panel runs one evalScript at a time and stops writing heartbeats while
+  // one blocks the host, so a command queued behind one of these reads a stale
+  // heartbeat from a panel that is busy, not gone.
+  private readonly commandsWithLivePanel = new Set<string>();
+  // Last time the panel was observed doing something: a fresh heartbeat or a
+  // response landing. Bridges the few hundred ms between a busy panel finishing
+  // one command and writing its next heartbeat.
+  private lastPanelActivityAt = 0;
 
   constructor() {
     this.logger = new Logger('PremiereProBridge');
@@ -1196,7 +1205,7 @@ export class PremiereProBridge implements PremiereProTransport {
       // Wait for response (in a real implementation, this would be handled by the UXP plugin).
       // Batch operations pass a larger timeout because a single round-trip does the work of
       // dozens of individual calls inside one ExtendScript pass.
-      return await this.waitForResponse(responseFile, timeoutMs);
+      return await this.waitForResponse(responseFile, timeoutMs, commandId);
     } catch (error) {
       this.logger.error(`Failed to execute script: ${error}`);
       throw error;
@@ -1208,6 +1217,7 @@ export class PremiereProBridge implements PremiereProTransport {
       // One case this does not close: when the panel is merely slow, the response file is
       // written after this has already run, so it stays until the directory is cleaned. The
       // command file is the one that matters here, because a stale command still executes.
+      this.commandsWithLivePanel.delete(commandId);
       await fs.unlink(commandStaging).catch(() => {});
       await fs.unlink(commandFile).catch(() => {});
       await fs.unlink(responseFile).catch(() => {});
@@ -1226,8 +1236,11 @@ export class PremiereProBridge implements PremiereProTransport {
     }
   }
 
-  private async waitForResponse(responseFile: string, timeout = 60000): Promise<any> {
+  private async waitForResponse(responseFile: string, timeout = 60000, commandId?: string): Promise<any> {
     const startTime = Date.now();
+    // Latched: once the panel has been seen alive during this wait, a heartbeat
+    // that later goes stale means the host is busy running a script, not gone.
+    let panelSeenAlive = false;
     // A response that exists but will not parse is a different failure from one that has
     // not arrived, and reporting it as the latter sends the reader to check whether
     // Premiere is running when the real problem is the payload. Allow a few attempts for a
@@ -1248,6 +1261,7 @@ export class PremiereProBridge implements PremiereProTransport {
       if (raw !== undefined) {
         try {
           const parsed = JSON.parse(raw);
+          this.lastPanelActivityAt = Date.now();
           if (parsed.result !== undefined) return parsed.result;
           return parsed;
         } catch (error) {
@@ -1262,13 +1276,27 @@ export class PremiereProBridge implements PremiereProTransport {
       // waiting the remaining minute just makes the caller sit on a dead socket.
       // A fresh heartbeat with started:true means the panel has the command and
       // we should wait out the real timeout (evalScript can be slow).
+      //
+      // The panel's heartbeat timer shares a thread with evalScript, so it stops
+      // while a long script blocks the host — app.encoder.encodeSequence handing
+      // a job to AME on a network mount did this for many seconds. Staleness
+      // therefore only means "absent" if the panel was never seen alive while
+      // this command waited: a heartbeat stays fresh for longer than the first
+      // check takes to arrive, so a panel that was listening when the command was
+      // published is always seen at that first check. Failing later reported
+      // exports as not sent that AME went on to render, and re-sending them
+      // produced duplicates.
       if (Date.now() - startTime >= BRIDGE_PANEL_ABSENT_MS) {
         const beat = await this.readHeartbeat();
-        if (!beat) {
+        if (beat) {
+          if (!beat.started) {
+            throw new Error(BRIDGE_NOT_STARTED);
+          }
+          panelSeenAlive = true;
+          this.lastPanelActivityAt = Date.now();
+          if (commandId) this.commandsWithLivePanel.add(commandId);
+        } else if (!panelSeenAlive && !this.panelBusyWithAnotherCommand()) {
           throw new Error(BRIDGE_PANEL_NOT_RUNNING);
-        }
-        if (!beat.started) {
-          throw new Error(BRIDGE_NOT_STARTED);
         }
       }
 
@@ -1283,9 +1311,25 @@ export class PremiereProBridge implements PremiereProTransport {
       );
     }
 
+    if (panelSeenAlive) {
+      throw new Error(
+        `Bridge response timeout after ${timeout}ms. The MCP Bridge panel was connected and ` +
+        'picked up this command, so it may still be running or may already have completed ' +
+        '(an export may already be queued in Media Encoder). Check its effect in Premiere ' +
+        'before sending it again, or the work will be duplicated.'
+      );
+    }
+
     throw new Error(
       'Bridge response timeout. Ensure Premiere Pro is open, MCP Bridge (CEP or UXP) panel is open, ' +
       'Temp Directory is set to ' + this.tempDir + ', and Start Bridge is clicked. Do not retry until the panel says Connected.'
+    );
+  }
+
+  private panelBusyWithAnotherCommand(): boolean {
+    return (
+      this.commandsWithLivePanel.size > 0 ||
+      Date.now() - this.lastPanelActivityAt < BRIDGE_HEARTBEAT_STALE_MS
     );
   }
 
