@@ -882,23 +882,6 @@ async function replaceClip(ctx: ToolContext, clipId: string, newProjectItemId: s
           var n = __canonicalName(name);
           return n === "motion" || n === "opacity" || n === "volume";
         }
-        function readMotion(clip) {
-          var motion = {};
-          if (!clip || !clip.components) return motion;
-          for (var ci = 0; ci < clip.components.numItems; ci++) {
-            var comp = clip.components[ci];
-            for (var pj = 0; pj < comp.properties.numItems; pj++) {
-              var pp = comp.properties[pj];
-              try {
-                if (__namesMatch(pp.displayName, "Opacity")) motion.opacity = pp.getValue();
-                else if (__namesMatch(pp.displayName, "Scale")) motion.scale = pp.getValue();
-                else if (__namesMatch(pp.displayName, "Rotation")) motion.rotation = pp.getValue();
-                else if (__namesMatch(pp.displayName, "Position")) motion.position = pp.getValue();
-              } catch (eRead) {}
-            }
-          }
-          return motion;
-        }
         function writeMotion(clip, motion) {
           var missing = [];
           function applyNamed(componentName, paramName, value) {
@@ -951,7 +934,7 @@ async function replaceClip(ctx: ToolContext, clipId: string, newProjectItemId: s
           inPoint: secondsOf(clip.inPoint),
           outPoint: secondsOf(clip.outPoint),
           disabled: !!clip.disabled,
-          motion: readMotion(clip),
+          motion: __readIntrinsicMotion(clip),
           effects: readEffects(clip)
         };
         var destTrack = info.track;
@@ -1064,24 +1047,12 @@ async function getClipProperties(ctx: ToolContext, clipId: string, sequenceId?: 
         } catch (e0) {}
         var motion = null;
         try {
-          var m = {};
-          for (var ci = 0; ci < clip.components.numItems; ci++) {
-            var comp = clip.components[ci];
-            for (var pj = 0; pj < comp.properties.numItems; pj++) {
-              var pp = comp.properties[pj];
-              try {
-                if (__namesMatch(pp.displayName, "Opacity")) m.opacity = pp.getValue();
-                else if (__namesMatch(pp.displayName, "Scale")) m.scale = pp.getValue();
-                else if (__namesMatch(pp.displayName, "Rotation")) m.rotation = pp.getValue();
-                else if (__namesMatch(pp.displayName, "Position")) {
-                  var pv = pp.getValue();
-                  if (pv && pv.length >= 2) {
-                    m.positionNormalized = { x: pv[0], y: pv[1] };
-                    m.position = { x: Math.round(pv[0] * __seqW * 1000) / 1000, y: Math.round(pv[1] * __seqH * 1000) / 1000 };
-                  }
-                }
-              } catch (ep) {}
-            }
+          var m = __readIntrinsicMotion(clip);
+          var pv = m.position;
+          delete m.position;
+          if (pv && pv.length >= 2) {
+            m.positionNormalized = { x: pv[0], y: pv[1] };
+            m.position = { x: Math.round(pv[0] * __seqW * 1000) / 1000, y: Math.round(pv[1] * __seqH * 1000) / 1000 };
           }
           motion = m;
         } catch (em) { motion = null; }

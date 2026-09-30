@@ -571,6 +571,18 @@ function __namesMatch(a, b) {
   if (String(a) === String(b)) return true;
   return __canonicalName(a) === __canonicalName(b);
 }
+// Premiere's fixed components. matchNames are not localized, so they identify
+// Motion/Opacity even when the display names are in another language.
+function __intrinsicKind(matchName) {
+  if (matchName === "AE.ADBE Motion") return "motion";
+  if (matchName === "AE.ADBE Opacity") return "opacity";
+  return null;
+}
+function __componentKeys(comp) {
+  var cMatch = "";
+  try { cMatch = String(comp.matchName || ""); } catch (eM) {}
+  return [__canonicalName(comp.displayName), __intrinsicKind(cMatch) || __canonicalName(cMatch)];
+}
 function __resolveClipProperty(clip, componentName, paramName) {
   if (!clip || !clip.components) {
     return { ok: false, error: "Clip has no components", available: [] };
@@ -581,47 +593,70 @@ function __resolveClipProperty(clip, componentName, paramName) {
   var axis = null;
   if (rawParam === "positionx" || rawParam === "posx") axis = "x";
   if (rawParam === "positiony" || rawParam === "posy") axis = "y";
+  // The named component is searched first; the intrinsic fallbacks only when it
+  // lacks the parameter. Searching them together let the clip's own Opacity
+  // answer for "Timecode > Opacity" whenever it came first in the list.
   var searchComps = [wantComp];
-  if (wantParam === "opacity") searchComps.push("opacity");
-  if (wantParam === "level") searchComps.push("volume");
+  if (wantParam === "opacity" && wantComp !== "opacity") searchComps.push("opacity");
+  if (wantParam === "level" && wantComp !== "volume") searchComps.push("volume");
   var available = [];
-  var matchedComp = null;
-  var matchedParam = null;
   for (var i = 0; i < clip.components.numItems; i++) {
     var comp = clip.components[i];
-    var cName = String(comp.displayName);
     var cMatch = "";
     try { cMatch = String(comp.matchName || ""); } catch (eM) {}
     var props = [];
     for (var j = 0; j < comp.properties.numItems; j++) {
       props.push(String(comp.properties[j].displayName));
     }
-    available.push({ component: cName, matchName: cMatch, properties: props });
-    var compHits = false;
-    for (var sc = 0; sc < searchComps.length; sc++) {
-      if (__canonicalName(cName) === searchComps[sc] || __canonicalName(cMatch) === searchComps[sc]) {
-        compHits = true;
+    available.push({ component: String(comp.displayName), matchName: cMatch, properties: props });
+  }
+  for (var sc = 0; sc < searchComps.length; sc++) {
+    for (var ci = 0; ci < clip.components.numItems; ci++) {
+      var c = clip.components[ci];
+      var keys = __componentKeys(c);
+      if (keys[0] !== searchComps[sc] && keys[1] !== searchComps[sc]) continue;
+      for (var k = 0; k < c.properties.numItems; k++) {
+        var p = c.properties[k];
+        if (__canonicalName(p.displayName) === wantParam) {
+          return { ok: true, component: c, property: p, axis: axis, available: available };
+        }
       }
     }
-    if (!compHits) continue;
-    if (!matchedComp) matchedComp = comp;
-    for (var k = 0; k < comp.properties.numItems; k++) {
-      var p = comp.properties[k];
-      if (__canonicalName(p.displayName) === wantParam) {
-        matchedParam = p;
-        break;
-      }
+  }
+  return {
+    ok: false,
+    error: "Parameter " + paramName + " not found in component " + componentName,
+    available: available
+  };
+}
+// Only Motion and Opacity count; an effect such as Timecode has its own Position
+// and Opacity that must not be read as the clip's framing. Without matchNames,
+// the first two components are the intrinsic ones.
+function __isIntrinsicVisualComponent(comp, index) {
+  var cMatch = "";
+  try { cMatch = String(comp.matchName || ""); } catch (eM) {}
+  if (cMatch) return __intrinsicKind(cMatch) !== null;
+  return index < 2;
+}
+// Raw values of the clip's own opacity/scale/rotation/position. The first match
+// wins, so Scale Width (which folds to "scale") cannot overwrite Scale.
+function __readIntrinsicMotion(clip) {
+  var motion = {};
+  if (!clip || !clip.components) return motion;
+  for (var ci = 0; ci < clip.components.numItems; ci++) {
+    var comp = clip.components[ci];
+    if (!__isIntrinsicVisualComponent(comp, ci)) continue;
+    for (var pj = 0; pj < comp.properties.numItems; pj++) {
+      var pp = comp.properties[pj];
+      try {
+        var key = __canonicalName(pp.displayName);
+        if (key !== "opacity" && key !== "scale" && key !== "rotation" && key !== "position") continue;
+        if (motion[key] !== undefined) continue;
+        motion[key] = pp.getValue();
+      } catch (eRead) {}
     }
-    if (matchedParam) break;
   }
-  if (!matchedParam) {
-    return {
-      ok: false,
-      error: "Parameter " + paramName + " not found in component " + componentName,
-      available: available
-    };
-  }
-  return { ok: true, component: matchedComp, property: matchedParam, axis: axis, available: available };
+  return motion;
 }
 function __coercePropertyValue(property, value, axis) {
   var current = null;
