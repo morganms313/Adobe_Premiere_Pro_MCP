@@ -78,7 +78,7 @@ else
   fail "Adobe CEP debug mode not enabled for any CSXS runtime (10-15)"
 fi
 # Premiere 2026 (26.x) uses CSXS.13 — warn loudly if it is not enabled.
-if [[ " ${DEBUG_MISSING[*]} " == *" 13 "* ]]; then
+if [[ " ${DEBUG_MISSING[*]:-} " == *" 13 "* ]]; then
   fail "Adobe CEP debug mode not enabled for CSXS.13 (Premiere Pro 2026) — run: defaults write com.adobe.CSXS.13 PlayerDebugMode 1"
 fi
 
