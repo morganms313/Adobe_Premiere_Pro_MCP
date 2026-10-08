@@ -105,9 +105,12 @@ fi
 # ---- 5b. Skill runtime deps (cr-image-subtitles QA scripts) ----------------
 # The image-sub QA scripts (subcheck/fncheck/fntiming/imgeval/...) need Pillow +
 # numpy, and a local vision model served by ollama (qwen2.5vl baseline).
-step "Skill runtime deps: ollama, tesseract, Python Pillow/numpy"
+# subplace measures Arabic/Thai widths with Pillow's raqm, which needs Homebrew's
+# FriBiDi; without it runs still work but widths are unshaped estimates.
+step "Skill runtime deps: ollama, tesseract, fribidi, Python Pillow/numpy"
 brew list ollama >/dev/null 2>&1    || brew install ollama
 brew list tesseract >/dev/null 2>&1 || brew install tesseract
+brew list fribidi >/dev/null 2>&1   || brew install fribidi
 python3 -m pip install --quiet --upgrade pip pillow numpy || \
   warn "pip install pillow/numpy failed — install into your preferred Python env manually."
 
