@@ -137,7 +137,6 @@ cat <<'EOF'
         Slack, Gmail, Google Drive, Google Calendar, Adobe creativity
         (run: claude mcp list   to see auth status)
   [ ] Mount + sign into Lucid cloud storage (the fast-pipe payoff)
-  [ ] Copy local brand assets not in git: ~/Downloads/CR_NoReg_Review/ etc.
   [ ] Pull the vision model(s) for the image-sub QA skill (multi-GB — the fast
       office pipe makes this quick):
         ollama serve &            # if not already running as a service
