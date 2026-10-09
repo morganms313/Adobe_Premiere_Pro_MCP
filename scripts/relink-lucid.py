@@ -28,11 +28,16 @@ deliverable), the path is reported ambiguous and left untouched.
 
 Rewritten projects open fully online — no dialog, no folder scan.
 
-    relink-lucid.py --index                     # build/refresh the file index
+    relink-lucid.py --index                     # build/refresh the file index (+ publish it)
     relink-lucid.py --dry-run DIR_OR_PRPROJ...  # report, touch nothing
     relink-lucid.py --fix     DIR_OR_PRPROJ...  # rewrite (leaves .bak)
 
 Premiere must be closed for any project passed to --fix.
+
+The index is shared through Lucid (SHARED_CACHE, a hidden folder in the Versioning
+Tools folder): --index publishes a copy there, and every run uses whichever of the
+local and shared copies is newer, so one crawl (usually the office mini's) serves
+every Mac instead of each re-crawling for 10+ minutes.  --no-shared turns it off.
 """
 
 from __future__ import annotations
@@ -119,6 +124,9 @@ IGNORE = (".prv/", "adobe premiere pro video previews", "/media cache",
 PATH_ELEMENTS = ("FilePath", "ActualMediaFilePath")
 
 CACHE = os.path.expanduser("~/.cache/cr-relink/index.tsv")
+SHARED_CACHE = ("/Volumes/crunchyroll/mvo/01_Marketing Versioning Operations/_Resources/Versioning/"
+                "Tools/.cr-relink/index.tsv")
+SHARED_DIRNAME = ".cr-relink"     # never crawled into the index itself
 
 
 # --------------------------------------------------------------------------
@@ -136,7 +144,8 @@ def build_index(roots: list[str], cache: str) -> int:
                 print(f"  ! skipping {root} (not mounted)", file=sys.stderr)
                 continue
             print(f"  crawling {root} ...", file=sys.stderr)
-            for dirpath, _dirnames, filenames in os.walk(root, onerror=None):
+            for dirpath, dirnames, filenames in os.walk(root, onerror=None):
+                dirnames[:] = [d for d in dirnames if d != SHARED_DIRNAME]
                 for fn in filenames:
                     if fn == ".DS_Store":
                         continue
@@ -146,6 +155,45 @@ def build_index(roots: list[str], cache: str) -> int:
     print(f"  indexed {n:,} files in {time.time() - started:.0f}s -> {cache}",
           file=sys.stderr)
     return n
+
+
+def _age(path: str) -> str:
+    h = (time.time() - os.path.getmtime(path)) / 3600
+    return f"{h:.1f} h old" if h < 48 else f"{h / 24:.1f} days old"
+
+
+def publish_index(local: str, shared: str) -> bool:
+    """Copy the local index to the shared Lucid spot (atomically: tmp + rename, so another Mac never reads half a
+    file).  False when the Tools folder isn't mounted."""
+    tools = os.path.dirname(os.path.dirname(shared))
+    if not os.path.isdir(tools):
+        print(f"  ! not publishing: {tools} not mounted", file=sys.stderr)
+        return False
+    os.makedirs(os.path.dirname(shared), exist_ok=True)
+    tmp = shared + ".tmp"
+    shutil.copyfile(local, tmp)
+    os.replace(tmp, shared)
+    print(f"  published -> {shared}", file=sys.stderr)
+    return True
+
+
+def choose_index(local: str, shared: str | None) -> tuple[str, str]:
+    """(path to read, 'local' | 'shared').  Uses whichever copy is newer; a newer shared copy is pulled into the
+    local cache first so the read isn't over the FUSE mount."""
+    have_local = os.path.exists(local)
+    have_shared = bool(shared) and os.path.exists(shared)
+    if have_shared and (not have_local or os.path.getmtime(shared) > os.path.getmtime(local)):
+        os.makedirs(os.path.dirname(local), exist_ok=True)
+        tmp = local + ".tmp"
+        shutil.copyfile(shared, tmp)
+        shutil.copystat(shared, tmp)
+        os.replace(tmp, local)
+        print(f"  using the shared index ({_age(local)}) from {shared}", file=sys.stderr)
+        return local, "shared"
+    if have_local:
+        print(f"  using the local index ({_age(local)})", file=sys.stderr)
+        return local, "local"
+    sys.exit(f"no index at {local} or {shared} — run: {sys.argv[0]} --index")
 
 
 def load_index(cache: str) -> dict[str, list[str]]:
@@ -390,12 +438,17 @@ def main() -> int:
     ap.add_argument("--fix", action="store_true",
                     help="rewrite the projects in place (leaves a .bak)")
     ap.add_argument("--cache", default=CACHE, help=f"index location [{CACHE}]")
+    ap.add_argument("--no-shared", action="store_true",
+                    help=f"don't publish to or read from the shared Lucid index [{SHARED_CACHE}]")
     ap.add_argument("targets", nargs="*",
                     help=".prproj files or directories to scan")
     args = ap.parse_args()
 
+    shared = None if args.no_shared else SHARED_CACHE
     if args.index:
         build_index(INDEX_ROOTS, args.cache)
+        if shared:
+            publish_index(args.cache, shared)
         if not args.targets:
             return 0
 
@@ -409,7 +462,8 @@ def main() -> int:
         print("no .prproj files found")
         return 1
 
-    resolver = Resolver(load_index(args.cache))
+    index_path, _ = choose_index(args.cache, shared)
+    resolver = Resolver(load_index(index_path))
     totals: dict[str, int] = defaultdict(int)
     results = []
 
