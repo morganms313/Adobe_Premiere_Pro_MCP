@@ -138,7 +138,7 @@ export const projectTools: ToolModule[] = [
     description: 'Sets footage interpretation settings (frame rate, pixel aspect ratio) for a project item.',
     inputSchema: z.object({
       projectItemId: z.string().describe('The ID of the project item'),
-      frameRate: z.number().optional().describe('Override frame rate'),
+      frameRate: z.number().optional().describe('Override frame rate. Near-NTSC values (23.976/23.98, 29.97, 59.94) are snapped to the exact 24000/1001, 30000/1001, 60000/1001'),
       pixelAspectRatio: z.number().optional().describe('Override pixel aspect ratio')
     }),
     run: (ctx, args) => setFootageInterpretation(ctx, args.projectItemId, args.frameRate, args.pixelAspectRatio),
@@ -501,23 +501,43 @@ async function getFootageInterpretation(ctx: ToolContext, projectItemId: string)
   return await ctx.bridge.executeScript(script);
 }
 
+/**
+ * Premiere stores an interpreted frame rate exactly as given. A caller's 23.976
+ * is kept as 23.976000000 rather than 24000/1001, so on a 23.976 sequence frame
+ * k lands on source time k * 0.999999, floors to source frame k - 1, and the
+ * interpreted clip renders one frame late. Snap the usual NTSC spellings to the
+ * exact ratio; anything else passes through untouched.
+ */
+const NTSC_RATES = [24000 / 1001, 30000 / 1001, 60000 / 1001];
+const NTSC_SNAP_TOLERANCE = 0.01;
+
+export function snapNtscFrameRate(frameRate: number): number {
+  for (const exact of NTSC_RATES) {
+    if (Math.abs(frameRate - exact) < NTSC_SNAP_TOLERANCE) return exact;
+  }
+  return frameRate;
+}
+
 async function setFootageInterpretation(ctx: ToolContext, projectItemId: string, frameRate?: number, pixelAspectRatio?: number): Promise<any> {
   const setFrameRate = frameRate !== undefined;
   const setPar = pixelAspectRatio !== undefined;
+  const appliedFrameRate = setFrameRate ? snapNtscFrameRate(frameRate) : undefined;
   const script = `
       try {
         var item = __findProjectItem(${JSON.stringify(projectItemId)});
         if (!item) return JSON.stringify({ success: false, error: "Project item not found" });
         var interp = item.getFootageInterpretation();
-        ${setFrameRate ? 'interp.frameRate = ' + frameRate + ';' : ''}
+        ${setFrameRate ? 'interp.frameRate = ' + JSON.stringify(appliedFrameRate) + ';' : ''}
         ${setPar ? 'interp.pixelAspectRatio = ' + pixelAspectRatio + ';' : ''}
         item.setFootageInterpretation(interp);
+        var stored = item.getFootageInterpretation();
         return JSON.stringify({
           success: true,
           message: "Footage interpretation updated",
           projectItemId: ${JSON.stringify(projectItemId)},
-          frameRate: interp.frameRate,
-          pixelAspectRatio: interp.pixelAspectRatio
+          ${setFrameRate ? 'requestedFrameRate: ' + JSON.stringify(frameRate) + ',' : ''}
+          frameRate: stored.frameRate,
+          pixelAspectRatio: stored.pixelAspectRatio
         });
       } catch (e) {
         return JSON.stringify({ success: false, error: e.toString() });
