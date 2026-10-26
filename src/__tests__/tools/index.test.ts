@@ -12,6 +12,7 @@ import { join } from 'node:path';
 import { PremiereProTools, evaluateTextInjectionResult } from '../../tools/index.js';
 import * as discovery from '../../tools/domains/discovery.js';
 import { PremiereProBridge } from '../../bridge/index.js';
+import { OFFLINE_SETTLE } from '../../tools/domains/project.js';
 import { executeExpandedTool, expandedToolNames, unimplementedExpandedToolNames } from '../../tools/expanded.js';
 
 jest.mock('../../bridge/index.js');
@@ -772,6 +773,114 @@ describe('PremiereProTools', () => {
       expect(result.success).toBe(false);
       expect(result.error).toContain('did not activate');
       expect(result.actualPath).toBe('/tmp/AlreadyOpen.prproj');
+    });
+
+    function stubOfflineScan(offlineItems: Array<{ nodeId: string; name: string; treePath: string }>) {
+      return (script: string) => {
+        if (script.includes('walkForOffline')) {
+          return Promise.resolve({ success: true, offlineCount: offlineItems.length, offlineItems });
+        }
+        return Promise.resolve({
+          success: true,
+          id: 'doc-1',
+          name: 'Template.prproj',
+          path: '/Users/me/CR/Template.prproj',
+          isOpen: true,
+        });
+      };
+    }
+
+    it('cold-launches Premiere with the project and confirms it without reopening', async () => {
+      mockBridge.ensureHost = jest.fn().mockResolvedValue({
+        ready: true,
+        success: true,
+        status: 'connected',
+        launched: true,
+        openedPath: '/Users/me/CR/Template.prproj',
+      });
+      mockBridge.openProject = jest.fn();
+      mockBridge.executeScript = jest.fn().mockImplementation(stubOfflineScan([])) as any;
+
+      const result = await tools.executeTool('open_project', { path: '/Users/me/CR/Template.prproj' });
+
+      expect(mockBridge.ensureHost).toHaveBeenCalledWith(
+        expect.objectContaining({ launchIfNeeded: true, openPath: '/Users/me/CR/Template.prproj' }),
+      );
+      expect(mockBridge.openProject).not.toHaveBeenCalled();
+      expect(result.success).toBe(true);
+      expect(result.launchedPremiere).toBe(true);
+      expect(result.offlineMedia).toEqual({ offlineCount: 0, offlineItems: [], settled: true });
+      expect(result.warning).toBeUndefined();
+    });
+
+    it('waits for background media linking to settle before reporting offline items', async () => {
+      const saved = { ...OFFLINE_SETTLE };
+      Object.assign(OFFLINE_SETTLE, { pollMs: 1, stableReads: 3, maxMs: 1000 });
+      try {
+        const card = { nodeId: '000f1', name: 'card.png', treePath: '\\T\\card.png' };
+        // Right after an open Premiere still reports media it has not linked yet.
+        const counts = [49, 13, 1, 1, 1, 1, 1];
+        let scan = 0;
+        mockBridge.ensureHost = jest.fn().mockResolvedValue({ ready: true, success: true, status: 'connected' });
+        mockBridge.openProject = jest.fn().mockResolvedValue({ success: true, path: '/Users/me/CR/Template.prproj' } as any);
+        mockBridge.executeScript = jest.fn().mockImplementation((script: string) => {
+          const count = counts[Math.min(scan++, counts.length - 1)];
+          return Promise.resolve({
+            success: true,
+            offlineCount: count,
+            offlineItems: Array.from({ length: count }, () => card),
+          });
+        }) as any;
+
+        const result = await tools.executeTool('open_project', { path: '/Users/me/CR/Template.prproj' });
+
+        expect(result.offlineMedia.offlineCount).toBe(1);
+        expect(result.offlineMedia.settled).toBe(true);
+        expect(result.warning).toMatch(/1 project item is offline/);
+      } finally {
+        Object.assign(OFFLINE_SETTLE, saved);
+      }
+    });
+
+    it('returns the readiness failure when Premiere or the bridge never comes up', async () => {
+      mockBridge.ensureHost = jest.fn().mockResolvedValue({
+        ready: false,
+        success: false,
+        status: 'bridge_unavailable',
+        userActionRequired: true,
+        nextStep: 'A dialog may be waiting in Premiere.',
+      });
+      mockBridge.openProject = jest.fn();
+
+      const result = await tools.executeTool('open_project', { path: '/Users/me/CR/Template.prproj' });
+
+      expect(result.success).toBe(false);
+      expect(result.status).toBe('bridge_unavailable');
+      expect(result.projectPath).toBe('/Users/me/CR/Template.prproj');
+      expect(mockBridge.openProject).not.toHaveBeenCalled();
+    });
+
+    it('opens through the bridge when it is already connected and warns about offline media', async () => {
+      const offline = [{ nodeId: '000f1', name: 'card.png', treePath: '\\Template.prproj\\04_Graphics\\card.png' }];
+      mockBridge.ensureHost = jest.fn().mockResolvedValue({ ready: true, success: true, status: 'connected' });
+      mockBridge.openProject = jest.fn().mockResolvedValue({
+        success: true,
+        id: 'doc-1',
+        name: 'Template.prproj',
+        path: '/Users/me/CR/Template.prproj',
+      } as any);
+      mockBridge.executeScript = jest.fn().mockImplementation(stubOfflineScan(offline)) as any;
+
+      const saved = { ...OFFLINE_SETTLE };
+      Object.assign(OFFLINE_SETTLE, { pollMs: 1 });
+      const result = await tools.executeTool('open_project', { path: '/Users/me/CR/Template.prproj' });
+      Object.assign(OFFLINE_SETTLE, saved);
+
+      expect(mockBridge.openProject).toHaveBeenCalledWith('/Users/me/CR/Template.prproj');
+      expect(result.success).toBe(true);
+      expect(result.launchedPremiere).toBe(false);
+      expect(result.offlineMedia.offlineCount).toBe(1);
+      expect(result.warning).toMatch(/1 project item is offline/);
     });
 
     it('does not run automatic create_sequence recovery after a bridge timeout', async () => {

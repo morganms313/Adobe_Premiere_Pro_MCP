@@ -6,6 +6,19 @@
  */
 import { z } from 'zod';
 import type { ToolContext, ToolModule } from '../context.js';
+import { checkOfflineMedia } from './discovery.js';
+
+// A cold launch has to start Premiere, load the project, and bring up the
+// panel, which takes far longer than the 45 s a plain readiness check allows.
+const PROJECT_LAUNCH_WAIT_MS = 180000;
+// After a launch the bridge can come up a beat before the project is active.
+const PROJECT_ACTIVE_POLL_MS = 1000;
+const PROJECT_ACTIVE_ATTEMPTS = 15;
+// Premiere links media in the background after a project opens, so a scan
+// taken straight away lists items that are about to come online (49 offline
+// right after a cold open of the CR template, 1 forty seconds later). Rescan
+// until the count holds steady for `stableReads` scans in a row.
+export const OFFLINE_SETTLE = { pollMs: 3000, stableReads: 4, maxMs: 120000 };
 
 export const projectTools: ToolModule[] = [
   {
@@ -19,7 +32,7 @@ export const projectTools: ToolModule[] = [
   },
   {
     name: 'open_project',
-    description: 'Opens an existing Adobe Premiere Pro project from a specified file path.',
+    description: 'Opens an existing Adobe Premiere Pro project from a specified file path. Works with Premiere closed: like double-clicking the file, it launches Premiere with the project and waits for the MCP Bridge, so verify_premiere_connection is not needed first. Reports offline media afterwards.',
     inputSchema: z.object({
       path: z.string().describe('The absolute path to the .prproj file to open')
     }),
@@ -202,7 +215,21 @@ async function createProject(ctx: ToolContext, name: string, location: string): 
 
 async function openProject(ctx: ToolContext, path: string): Promise<any> {
   try {
-    const result: any = await ctx.bridge.openProject(path);
+    let launchedPremiere = false;
+    if (typeof ctx.bridge.ensureHost === 'function') {
+      const ensured = await ctx.bridge.ensureHost({
+        launchIfNeeded: true,
+        openPath: path,
+        waitMs: PROJECT_LAUNCH_WAIT_MS,
+      });
+      if (ensured && !ensured.ready) return { ...ensured, projectPath: path };
+      launchedPremiere = Boolean(ensured?.openedPath);
+    }
+
+    // Premiere already received the file at launch; asking it to open the
+    // project a second time is unnecessary, so only confirm it is active.
+    let result: any = launchedPremiere ? await waitForActiveProject(ctx, path) : null;
+    if (!result?.success) result = await ctx.bridge.openProject(path);
     if (result?.success === false) {
       return {
         ...result,
@@ -210,11 +237,24 @@ async function openProject(ctx: ToolContext, path: string): Promise<any> {
       };
     }
 
+    const { scan: offline, settled } = await settleOfflineMedia(ctx);
+    const offlineMedia = offline?.success
+      ? { offlineCount: offline.offlineCount, offlineItems: offline.offlineItems, settled }
+      : { error: offline?.error || 'Offline media check failed' };
+    const offlineCount = offline?.success ? offline.offlineCount : 0;
+
     return {
       success: true,
       message: `Project opened successfully`,
       projectPath: path,
-      ...result
+      ...result,
+      launchedPremiere,
+      offlineMedia,
+      ...(offlineCount > 0
+        ? {
+            warning: `${offlineCount} project item${offlineCount === 1 ? ' is' : 's are'} offline. Relink before building, or the deliverables will render media-offline frames.`,
+          }
+        : {}),
     };
   } catch (error) {
     return {
@@ -222,6 +262,46 @@ async function openProject(ctx: ToolContext, path: string): Promise<any> {
       error: `Failed to open project: ${error instanceof Error ? error.message : String(error)}`
     };
   }
+}
+
+async function settleOfflineMedia(ctx: ToolContext): Promise<{ scan: any; settled: boolean }> {
+  const deadline = Date.now() + OFFLINE_SETTLE.maxMs;
+  let scan: any = await checkOfflineMedia(ctx);
+  let steady = 1;
+  while (scan?.success && scan.offlineCount > 0 && steady < OFFLINE_SETTLE.stableReads) {
+    if (Date.now() >= deadline) return { scan, settled: false };
+    await new Promise((resolve) => setTimeout(resolve, OFFLINE_SETTLE.pollMs));
+    const next: any = await checkOfflineMedia(ctx);
+    if (!next?.success) return { scan: next, settled: false };
+    steady = next.offlineCount === scan.offlineCount ? steady + 1 : 1;
+    scan = next;
+  }
+  return { scan, settled: Boolean(scan?.success) };
+}
+
+async function waitForActiveProject(ctx: ToolContext, path: string): Promise<any> {
+  const script = `
+    var projectPath = ${JSON.stringify(path)};
+    var project = app.project;
+    var actualPath = project && project.path ? String(project.path) : "";
+    if (!project || !__samePath(actualPath, projectPath)) {
+      return JSON.stringify({ success: false, actualPath: actualPath });
+    }
+    return JSON.stringify({
+      success: true,
+      id: project.documentID,
+      name: project.name,
+      path: project.path,
+      isOpen: true
+    });
+  `;
+  let last: any = null;
+  for (let attempt = 0; attempt < PROJECT_ACTIVE_ATTEMPTS; attempt++) {
+    last = await ctx.bridge.executeScript(script);
+    if (last?.success) return last;
+    await new Promise((resolve) => setTimeout(resolve, PROJECT_ACTIVE_POLL_MS));
+  }
+  return last;
 }
 
 async function saveProject(ctx: ToolContext): Promise<any> {

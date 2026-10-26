@@ -145,6 +145,178 @@ describe('ensureHost', () => {
     }
   });
 
+  function stubMacInstall(): string {
+    const appPath = joinPremiereHostPath(
+      '/Applications',
+      'Adobe Premiere Pro 2026',
+      'Adobe Premiere Pro 2026.app',
+    );
+    mockFs.readdir.mockImplementation(async (target) => {
+      if (String(target) === '/Applications') return ['Adobe Premiere Pro 2026'] as never;
+      if (String(target).includes('Adobe Premiere Pro 2026')) return ['Adobe Premiere Pro 2026.app'] as never;
+      return [] as never;
+    });
+    mockFs.access.mockResolvedValue(undefined);
+    return appPath;
+  }
+
+  function stubPremiereRunning(): void {
+    mockExecFile.mockImplementation(((
+      _file: string,
+      _args: readonly string[] | undefined,
+      _opts: unknown,
+      callback?: (error: Error | null, stdout: string, stderr: string) => void,
+    ) => {
+      const cb = typeof _opts === 'function' ? _opts : callback;
+      if (cb) cb(null, '/Applications/Adobe Premiere Pro 2026/Adobe Premiere Pro 2026.app/Contents/MacOS/Adobe Premiere Pro 2026\n', '');
+      return {} as never;
+    }) as never);
+  }
+
+  it('cold-launches Premiere with the project file when openPath is given', async () => {
+    const restore = stubProcessPlatform('darwin');
+    try {
+      const appPath = stubMacInstall();
+      mockFs.readFile.mockRejectedValue(new Error('ENOENT'));
+
+      const bridge = new PremiereProBridge();
+      await bridge.initialize();
+      const result = await bridge.ensureHost({
+        launchIfNeeded: true,
+        waitMs: 20,
+        openPath: '/Users/me/CR/Template.prproj',
+      });
+
+      expect(mockSpawn).toHaveBeenCalledWith(
+        'open',
+        ['-a', appPath, '/Users/me/CR/Template.prproj'],
+        expect.objectContaining({ detached: true }),
+      );
+      expect(result.launched).toBe(true);
+      expect(result.openedPath).toBe('/Users/me/CR/Template.prproj');
+      expect(result.ready).toBe(false);
+      expect(result.nextStep).toMatch(/dialog/i);
+    } finally {
+      restore();
+    }
+  });
+
+  it('hands the project to a running Premiere whose bridge is down', async () => {
+    const restore = stubProcessPlatform('darwin');
+    try {
+      const appPath = stubMacInstall();
+      stubPremiereRunning();
+      let beats = 0;
+      mockFs.readFile.mockImplementation(async () => {
+        beats += 1;
+        // No panel until the project has been handed over, then a live bridge.
+        if (beats === 1) throw new Error('ENOENT');
+        return JSON.stringify({ t: Date.now(), started: true });
+      });
+
+      const bridge = new PremiereProBridge();
+      await bridge.initialize();
+      const result = await bridge.ensureHost({
+        launchIfNeeded: true,
+        waitMs: 2000,
+        openPath: '/Users/me/CR/Template.prproj',
+      });
+
+      expect(mockSpawn).toHaveBeenCalledWith(
+        'open',
+        ['-a', appPath, '/Users/me/CR/Template.prproj'],
+        expect.objectContaining({ detached: true }),
+      );
+      expect(result.ready).toBe(true);
+      expect(result.openedPath).toBe('/Users/me/CR/Template.prproj');
+    } finally {
+      restore();
+    }
+  });
+
+  it('leaves opening to the bridge when it is already connected', async () => {
+    const restore = stubProcessPlatform('darwin');
+    try {
+      stubMacInstall();
+      mockFs.readFile.mockResolvedValue(JSON.stringify({ t: Date.now(), started: true }));
+
+      const bridge = new PremiereProBridge();
+      await bridge.initialize();
+      const result = await bridge.ensureHost({
+        launchIfNeeded: true,
+        waitMs: 20,
+        openPath: '/Users/me/CR/Template.prproj',
+      });
+
+      expect(mockSpawn).not.toHaveBeenCalled();
+      expect(result.ready).toBe(true);
+      expect(result.openedPath).toBeUndefined();
+    } finally {
+      restore();
+    }
+  });
+
+  it('does not mistake Premiere helper processes for a running Premiere', async () => {
+    const restore = stubProcessPlatform('darwin');
+    try {
+      const appPath = stubMacInstall();
+      // Helpers that outlive the app and carry its path in their arguments.
+      mockExecFile.mockImplementation(((
+        _file: string,
+        _args: readonly string[] | undefined,
+        _opts: unknown,
+        callback?: (error: Error | null, stdout: string, stderr: string) => void,
+      ) => {
+        const cb = typeof _opts === 'function' ? _opts : callback;
+        if (cb) {
+          cb(null, [
+            '/Applications/Adobe Premiere Pro 2026/Adobe Premiere Pro 2026.app/Contents/MacOS/crashpad_handler',
+            '/Applications/Adobe Premiere Pro 2026/Adobe Premiere Pro 2026.app/Contents/MacOS/dynamiclinkmanager',
+            '/Library/Application Support/Adobe/Adobe Desktop Common/IPCBox/AdobeIPCBroker.app/Contents/MacOS/AdobeIPCBroker',
+          ].join('\n'), '');
+        }
+        return {} as never;
+      }) as never);
+      mockFs.readFile.mockRejectedValue(new Error('ENOENT'));
+
+      const bridge = new PremiereProBridge();
+      await bridge.initialize();
+      const result = await bridge.ensureHost({ launchIfNeeded: true, waitMs: 20 });
+
+      expect(mockSpawn).toHaveBeenCalledWith('open', ['-a', appPath], expect.objectContaining({ detached: true }));
+      expect(result.launched).toBe(true);
+    } finally {
+      restore();
+    }
+  });
+
+  it('passes the project file to Premiere.exe on Windows', async () => {
+    const restore = stubProcessPlatform('win32');
+    try {
+      const adobeRoot = joinPremiereHostPath(process.env.ProgramFiles || 'C:\\Program Files', 'Adobe');
+      const installDir = joinPremiereHostPath(adobeRoot, 'Adobe Premiere Pro 2026');
+      const exe = joinPremiereHostPath(installDir, 'Adobe Premiere Pro.exe');
+      mockFs.readdir.mockImplementation(async (target) => {
+        if (String(target) === adobeRoot) return ['Adobe Premiere Pro 2026'] as never;
+        return [] as never;
+      });
+      mockFs.access.mockResolvedValue(undefined);
+      mockFs.readFile.mockRejectedValue(new Error('ENOENT'));
+
+      const bridge = new PremiereProBridge();
+      await bridge.initialize();
+      await bridge.ensureHost({ launchIfNeeded: true, waitMs: 20, openPath: 'D:\\CR\\Template.prproj' });
+
+      expect(mockSpawn).toHaveBeenCalledWith(
+        exe,
+        ['D:\\CR\\Template.prproj'],
+        expect.objectContaining({ detached: true }),
+      );
+    } finally {
+      restore();
+    }
+  });
+
   it('launches Premiere.exe when an install path is found on Windows', async () => {
     const restore = stubProcessPlatform('win32');
     try {

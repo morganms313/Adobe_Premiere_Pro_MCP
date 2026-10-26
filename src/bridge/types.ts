@@ -8,6 +8,12 @@ import type {
 export interface EnsureHostOptions {
   launchIfNeeded?: boolean;
   waitMs?: number;
+  /**
+   * A .prproj to hand to Premiere when the bridge is down, the way a
+   * double-click does: it cold-launches Premiere with the project, or makes a
+   * running Premiere with no project (no panel, so no bridge) open it.
+   */
+  openPath?: string;
 }
 
 export interface EnsureHostResult {
@@ -15,6 +21,8 @@ export interface EnsureHostResult {
   success: boolean;
   status: string;
   launched?: boolean;
+  /** Set when ensureHost handed this project to Premiere itself. */
+  openedPath?: string;
   premiereRunning?: boolean;
   installPath?: string;
   error?: string;

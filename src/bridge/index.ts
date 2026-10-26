@@ -1032,7 +1032,14 @@ export class PremiereProBridge implements PremiereProTransport {
 
     const running = await this.isPremiereProcessRunning();
     let launched = false;
-    if (!running && launchIfNeeded && this.premiereLaunchPath) {
+    let openedPath: string | undefined;
+    if (launchIfNeeded && this.premiereLaunchPath && options.openPath) {
+      // Like a double-click: a closed Premiere starts with the project, and a
+      // running one sitting on its Home screen opens it, which loads the
+      // workspace and with it the MCP Bridge panel.
+      launched = this.launchPremiere(options.openPath);
+      if (launched) openedPath = options.openPath;
+    } else if (!running && launchIfNeeded && this.premiereLaunchPath) {
       launched = this.launchPremiere();
     }
 
@@ -1061,19 +1068,23 @@ export class PremiereProBridge implements PremiereProTransport {
         success: true,
         status: 'connected',
         launched,
+        ...(openedPath ? { openedPath } : {}),
         premiereRunning: true,
         ...(this.premiereInstallPath ? { installPath: this.premiereInstallPath } : {}),
       };
     }
 
-    const nextStep = launched
-      ? 'Premiere was launched but the MCP Bridge panel did not connect in time. When Premiere finishes opening, confirm Window > Extensions > MCP Bridge is visible, then run verify_premiere_connection once. Do not retry other tools yet.'
-      : BRIDGE_PANEL_NOT_RUNNING;
+    const nextStep = openedPath
+      ? `Premiere was asked to open ${openedPath} but the MCP Bridge panel did not connect in time. A dialog (Link Media, project conversion, crash recovery, missing fonts) may be waiting in Premiere, or the project is still loading. Clear any dialog, confirm Window > Extensions > MCP Bridge is visible, then run verify_premiere_connection once. Do not retry other tools yet.`
+      : launched
+        ? 'Premiere was launched but the MCP Bridge panel did not connect in time. When Premiere finishes opening, confirm Window > Extensions > MCP Bridge is visible, then run verify_premiere_connection once. Do not retry other tools yet.'
+        : BRIDGE_PANEL_NOT_RUNNING;
     return {
       ready: false,
       success: false,
       status: 'bridge_unavailable',
       launched,
+      ...(openedPath ? { openedPath } : {}),
       premiereRunning: true,
       retry: false,
       userActionRequired: true,
@@ -1088,8 +1099,12 @@ export class PremiereProBridge implements PremiereProTransport {
   private async isPremiereProcessRunning(): Promise<boolean> {
     try {
       if (process.platform === 'darwin') {
-        await execFileAsync('pgrep', ['-f', 'Adobe Premiere Pro'], { timeout: 3000 });
-        return true;
+        // Match the app's own executable. `pgrep -f "Adobe Premiere Pro"`
+        // also matched crashpad_handler, dynamiclinkmanager and the IPC
+        // broker, which outlive Premiere and carry its path, so a closed
+        // Premiere looked running and was never launched.
+        const { stdout } = await execFileAsync('ps', ['-axo', 'comm'], { timeout: 3000 });
+        return /\/Contents\/MacOS\/Adobe Premiere Pro( \d{4})?$/m.test(stdout);
       }
       if (process.platform === 'win32') {
         const { stdout } = await execFileAsync(
@@ -1105,15 +1120,18 @@ export class PremiereProBridge implements PremiereProTransport {
     return false;
   }
 
-  private launchPremiere(): boolean {
+  private launchPremiere(openPath?: string): boolean {
     if (!this.premiereLaunchPath) return false;
+    const fileArgs = openPath ? [openPath] : [];
     try {
       const child =
         process.platform === 'darwin'
-          ? spawn('open', ['-a', this.premiereLaunchPath], { detached: true, stdio: 'ignore' })
-          : spawn(this.premiereLaunchPath, [], { detached: true, stdio: 'ignore', windowsHide: false });
+          ? spawn('open', ['-a', this.premiereLaunchPath, ...fileArgs], { detached: true, stdio: 'ignore' })
+          : spawn(this.premiereLaunchPath, fileArgs, { detached: true, stdio: 'ignore', windowsHide: false });
       child.unref();
-      this.logger.info(`Launched Adobe Premiere Pro from ${this.premiereLaunchPath}`);
+      this.logger.info(
+        `Launched Adobe Premiere Pro from ${this.premiereLaunchPath}${openPath ? ` with ${openPath}` : ''}`,
+      );
       return true;
     } catch (error) {
       this.logger.warn(`Failed to launch Adobe Premiere Pro: ${error instanceof Error ? error.message : String(error)}`);

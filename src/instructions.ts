@@ -9,6 +9,7 @@ export const MCP_SERVER_INSTRUCTIONS = [
   '',
   'Connection — do this first, once per session:',
   '- Call verify_premiere_connection before any editing tool. If Premiere is installed and not running, that call launches it and waits for the MCP Bridge panel. The CEP panel auto-starts the bridge when Premiere opens it; the user should not have to click Start Bridge.',
+  '- To work on a specific project, invoke open_project with its .prproj path instead. Like double-clicking the file, it launches Premiere with the project when Premiere is closed (or sitting on its Home screen with no bridge), waits for the bridge, and reports offline media.',
   '- If verify_premiere_connection or any other tool returns retry:false with userActionRequired:true, tell the user the nextStep verbatim and STOP. Do not call other editing tools. Do not retry the failed tool.',
   '- A missing MCP Bridge is not a Premiere editing failure. Do not call list_sequences, import_media, apply_effect, or similar until verify_premiere_connection succeeds.',
   '',

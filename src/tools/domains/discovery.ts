@@ -978,7 +978,7 @@ async function getClipAtPosition(ctx: ToolContext, sequenceId: string, trackType
   return await ctx.bridge.executeScript(script);
 }
 
-async function checkOfflineMedia(ctx: ToolContext): Promise<any> {
+export async function checkOfflineMedia(ctx: ToolContext): Promise<any> {
   const script = `
       try {
         var offlineItems = [];
