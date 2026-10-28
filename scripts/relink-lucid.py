@@ -331,7 +331,7 @@ def process(project: str, resolver: Resolver, apply: bool) -> dict:
     xml, gzipped = read_project(project)
     project_dir = os.path.dirname(os.path.abspath(project))
     stats = defaultdict(int)
-    unresolved: list[tuple[str, str]] = []
+    unresolved: list[tuple[str, str, str | None]] = []
     seen: set[str] = set()
 
     def rewrite_paths(text: str) -> str:
@@ -342,8 +342,8 @@ def process(project: str, resolver: Resolver, apply: bool) -> dict:
             if old not in seen:
                 seen.add(old)
                 stats[status] += 1
-                if status in ("ambiguous", "nomatch", "picked"):
-                    unresolved.append((status, old))
+                if status in OFFLINE_ON_OPEN:
+                    unresolved.append((status, old, new))
             if new is None:
                 return m.group(0)
             return f"<{tag}>{escape(new)}</{tag}>"
@@ -426,6 +426,12 @@ def collect_projects(targets: list[str]) -> list[str]:
 
 ORDER = ["prefix", "index", "picked", "ambiguous", "nomatch",
          "online", "skipped", "foreign", "cleared"]
+# Every status whose stored path is not the file on disk. Any one of them puts
+# up Premiere's Link Media dialog on open, which wedges the MCP bridge; a
+# prefix/index match is only "fixable", not online, until --fix writes it.
+OFFLINE_ON_OPEN = ("prefix", "index", "picked", "ambiguous", "nomatch")
+# What is still offline after --fix (no path to write).
+LEFT_OFFLINE = ("ambiguous", "nomatch")
 
 
 def main() -> int:
@@ -483,7 +489,7 @@ def main() -> int:
         ) or "no media paths"
         flag = "" if args.dry_run else (" [written]" if r["changed"] else " [no change]")
         print(f"\n{rel}\n  {summary}{flag}")
-        for status, path in r["unresolved"]:
+        for status, path, new in r["unresolved"]:
             print(f"    {status.upper():9} {path}")
             if status == "ambiguous":
                 for c in resolver.ambiguous.get(path, []):
@@ -491,15 +497,29 @@ def main() -> int:
             elif status == "picked":
                 chosen, n = resolver.picked[path]
                 print(f"              -> {chosen}   ({n} candidates)")
+            elif new:
+                print(f"              -> {new}")
 
     print("\n" + "=" * 70)
     print(f"{len(results)} project(s)")
     for k in ORDER:
         if totals.get(k):
             print(f"  {k:10} {totals[k]}")
+
+    gate = LEFT_OFFLINE if args.fix else OFFLINE_ON_OPEN
+    offline = sum(totals.get(k, 0) for k in gate)
+    if offline:
+        how = ("still offline after --fix" if args.fix
+               else "offline at their stored path")
+        print(f"\nNOT CLEAN TO OPEN: {offline} item(s) {how} -> Premiere WILL show "
+              "Link Media and wedge the bridge. "
+              + ("Find these files or accept the dialog."
+                 if args.fix else "Run --fix (Premiere closed) or accept the dialog."))
+    else:
+        print("\nCLEAN TO OPEN: every media path is online.")
     if args.dry_run:
-        print("\ndry run — nothing written. Re-run with --fix to apply.")
-    return 0
+        print("dry run — nothing written. Re-run with --fix to apply.")
+    return 2 if offline else 0
 
 
 if __name__ == "__main__":
